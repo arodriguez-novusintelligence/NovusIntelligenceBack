@@ -72,7 +72,7 @@ export async function handler(
     return methodNotAllowedResponse(requestId, cors);
   }
 
-  // SEC-002: rate limit por IP (ventana 60s) — además del throttle API Gateway
+  // SEC-002: rate limit por IP (ventana 5 min) — además del throttle API Gateway
   const clientIp = getClientIp(event);
   if (isIpRateLimited(clientIp, config.rateLimitPerIp)) {
     logStructured({
