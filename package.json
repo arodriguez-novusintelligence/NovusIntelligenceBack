@@ -1,0 +1,27 @@
+{
+  "name": "novus-intelligence-back",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Novus Intelligence backend — Serverless API (Node.js 20 + TypeScript)",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ses": "^3.758.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.21.0",
+    "@types/aws-lambda": "^8.10.147",
+    "@types/node": "^20.17.19",
+    "eslint": "^9.21.0",
+    "serverless": "^3.40.0",
+    "serverless-esbuild": "^1.55.1",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.24.1"
+  }
+}
