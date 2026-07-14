@@ -32,7 +32,7 @@ jobs:
           AWS_DEFAULT_REGION: sa-east-1
           CONTACT_EMAIL_FROM: ${{ secrets.CONTACT_EMAIL_FROM }}
           CONTACT_EMAIL_TO: ${{ secrets.CONTACT_EMAIL_TO }}
-          EMAIL_DRY_RUN: ${{ secrets.EMAIL_DRY_RUN || 'true' }}
+          EMAIL_DRY_RUN: ${{ secrets.EMAIL_DRY_RUN || 'false' }}
           CORS_ALLOWED_ORIGINS: ${{ secrets.CORS_ALLOWED_ORIGINS }}
           CAPTCHA_ENABLED: "false"
         run: npx serverless deploy --stage dev --region sa-east-1
