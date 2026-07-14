@@ -10,6 +10,8 @@ export interface AppConfig {
   crmWebhookUrl?: string;
   logLevel: string;
   awsRegion: string;
+  /** DEV-only: accept contact without SES (logs payload). */
+  emailDryRun: boolean;
 }
 
 function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
@@ -28,10 +30,19 @@ function requireEnv(name: string): string {
 }
 
 export function loadConfig(): AppConfig {
+  const emailDryRun = parseBoolean(process.env.EMAIL_DRY_RUN, false);
+  const contactEmailFrom = process.env.CONTACT_EMAIL_FROM ?? '';
+  const contactEmailTo = process.env.CONTACT_EMAIL_TO ?? '';
+
+  if (!emailDryRun) {
+    requireEnv('CONTACT_EMAIL_FROM');
+    requireEnv('CONTACT_EMAIL_TO');
+  }
+
   return {
     nodeEnv: process.env.NODE_ENV ?? 'production',
-    contactEmailFrom: requireEnv('CONTACT_EMAIL_FROM'),
-    contactEmailTo: requireEnv('CONTACT_EMAIL_TO'),
+    contactEmailFrom,
+    contactEmailTo,
     corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? '')
       .split(',')
       .map((origin) => origin.trim())
@@ -44,5 +55,6 @@ export function loadConfig(): AppConfig {
     crmWebhookUrl: process.env.CRM_WEBHOOK_URL || undefined,
     logLevel: process.env.LOG_LEVEL ?? 'info',
     awsRegion: process.env.AWS_REGION ?? 'sa-east-1',
+    emailDryRun,
   };
 }
