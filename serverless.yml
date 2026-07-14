@@ -1,0 +1,103 @@
+service: novus-intelligence-back
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'sa-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 14
+  architecture: arm64
+  httpApi:
+    name: novus-intelligence-api-${self:provider.stage}
+    cors:
+      allowedOrigins:
+        - https://dev.novusintelligence.com
+        - http://localhost:5173
+      allowedMethods:
+        - POST
+        - OPTIONS
+      allowedHeaders:
+        - Content-Type
+      allowCredentials: false
+    throttle:
+      burstLimit: 20
+      rateLimit: 10
+  environment:
+    NODE_ENV: ${self:provider.stage}
+    CONTACT_EMAIL_FROM: ${env:CONTACT_EMAIL_FROM, ''}
+    CONTACT_EMAIL_TO: ${env:CONTACT_EMAIL_TO, ''}
+    CORS_ALLOWED_ORIGINS: ${env:CORS_ALLOWED_ORIGINS, 'https://dev.novusintelligence.com,http://localhost:5173'}
+    RATE_LIMIT_PER_IP: ${env:RATE_LIMIT_PER_IP, '10'}
+    CAPTCHA_ENABLED: ${env:CAPTCHA_ENABLED, 'false'}
+    CAPTCHA_PROVIDER: ${env:CAPTCHA_PROVIDER, 'turnstile'}
+    CAPTCHA_SECRET: ${env:CAPTCHA_SECRET, ''}
+    CRM_WEBHOOK_URL: ${env:CRM_WEBHOOK_URL, ''}
+    LOG_LEVEL: ${env:LOG_LEVEL, 'info'}
+  iam:
+    role:
+      statements:
+        # SEC-001: restringir SES a identities de la cuenta/región (no Resource: *)
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+            - ses:SendRawEmail
+          Resource:
+            - Fn::Sub: arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource:
+            - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/novus-contact-handler-${self:provider.stage}:*
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    target: node20
+    platform: node
+    external: []
+
+functions:
+  novusContactHandler:
+    name: novus-contact-handler-${self:provider.stage}
+    handler: src/handlers/contact.handler
+    description: Contact form handler — POST /api/v1/contact
+    events:
+      - httpApi:
+          path: /api/v1/contact
+          method: post
+      - httpApi:
+          path: /api/v1/contact
+          method: options
+
+resources:
+  Resources:
+    ContactApiGatewayThrottleAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: novus-contact-handler-errors-${self:provider.stage}
+        AlarmDescription: Lambda errors for novus-contact-handler
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: novus-contact-handler-${self:provider.stage}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+package:
+  individually: true
