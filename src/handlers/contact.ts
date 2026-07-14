@@ -6,9 +6,11 @@ import {
   internalErrorResponse,
   logStructured,
   methodNotAllowedResponse,
+  rateLimitResponse,
   successResponse,
   validationErrorResponse,
 } from '../lib/response/httpResponse';
+import { isIpRateLimited } from '../lib/rateLimit/ipRateLimiter';
 import {
   getValidationSummary,
   validateContactRequest,
@@ -68,6 +70,20 @@ export async function handler(
       durationMs: Date.now() - startedAt,
     });
     return methodNotAllowedResponse(requestId, cors);
+  }
+
+  // SEC-002: rate limit por IP (ventana 60s) — además del throttle API Gateway
+  const clientIp = getClientIp(event);
+  if (isIpRateLimited(clientIp, config.rateLimitPerIp)) {
+    logStructured({
+      level: 'warn',
+      event: 'rate_limited',
+      requestId,
+      clientIp,
+      limit: config.rateLimitPerIp,
+      durationMs: Date.now() - startedAt,
+    });
+    return rateLimitResponse(requestId, cors);
   }
 
   const contentType = event.headers['content-type'] ?? event.headers['Content-Type'] ?? '';

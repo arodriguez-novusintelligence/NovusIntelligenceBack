@@ -40,17 +40,20 @@ provider:
   iam:
     role:
       statements:
+        # SEC-001: restringir SES a identities de la cuenta/región (no Resource: *)
         - Effect: Allow
           Action:
             - ses:SendEmail
             - ses:SendRawEmail
-          Resource: '*'
+          Resource:
+            - Fn::Sub: arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
         - Effect: Allow
           Action:
             - logs:CreateLogGroup
             - logs:CreateLogStream
             - logs:PutLogEvents
-          Resource: '*'
+          Resource:
+            - Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/novus-contact-handler-${self:provider.stage}:*
 
 plugins:
   - serverless-esbuild
