@@ -1,6 +1,7 @@
 import { SESClient, SendEmailCommand } from '@aws-sdk/client-ses';
 import type { AppConfig } from '../../lib/config/env';
 import { escapeHtml } from '../../lib/sanitize/sanitize';
+import { DryRunEmailService } from './dryRunEmailService';
 import type { ContactEmailPayload, EmailService } from './emailService';
 
 export class SesEmailService implements EmailService {
@@ -66,5 +67,8 @@ export class SesEmailService implements EmailService {
 }
 
 export function createEmailService(config: AppConfig): EmailService {
+  if (config.emailDryRun) {
+    return new DryRunEmailService();
+  }
   return new SesEmailService(config);
 }
