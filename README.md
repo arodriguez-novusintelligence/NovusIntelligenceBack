@@ -27,6 +27,7 @@ Solo nombres documentados. Valores en AWS Secrets Manager / SSM — **nunca en r
 |----------|-------------|-------------|
 | `CONTACT_EMAIL_FROM` | Sí | Remitente SES verificado |
 | `CONTACT_EMAIL_TO` | Sí | Destinatario notificaciones |
+| `EMAIL_DRY_RUN` | No | Solo local (`NODE_ENV=development`); nunca en despliegues |
 | `CORS_ALLOWED_ORIGINS` | Sí | Orígenes permitidos (coma-separados) |
 | `RATE_LIMIT_PER_IP` | No | Umbral rate limit (referencia; WAF en IaC) |
 | `CAPTCHA_ENABLED` | No | `true` para exigir captcha |

@@ -30,7 +30,10 @@ function requireEnv(name: string): string {
 }
 
 export function loadConfig(): AppConfig {
-  const emailDryRun = parseBoolean(process.env.EMAIL_DRY_RUN, false);
+  const nodeEnv = process.env.NODE_ENV ?? 'production';
+  // R-001: dry run only for explicit local development — never in deployed stages
+  const emailDryRun =
+    parseBoolean(process.env.EMAIL_DRY_RUN, false) && nodeEnv === 'development';
   const contactEmailFrom = process.env.CONTACT_EMAIL_FROM ?? '';
   const contactEmailTo = process.env.CONTACT_EMAIL_TO ?? '';
 
@@ -40,7 +43,7 @@ export function loadConfig(): AppConfig {
   }
 
   return {
-    nodeEnv: process.env.NODE_ENV ?? 'production',
+    nodeEnv,
     contactEmailFrom,
     contactEmailTo,
     corsAllowedOrigins: (process.env.CORS_ALLOWED_ORIGINS ?? '')

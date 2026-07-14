@@ -9,7 +9,8 @@ interface Bucket {
 }
 
 const buckets = new Map<string, Bucket>();
-const WINDOW_MS = 60_000;
+/** 10 requests per 5 minutes (especificacion-backend.md) */
+const WINDOW_MS = 300_000;
 
 export function isIpRateLimited(
   ip: string | undefined,

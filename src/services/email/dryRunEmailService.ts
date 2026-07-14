@@ -1,6 +1,6 @@
 import type { ContactEmailPayload, EmailService } from './emailService';
 
-/** DEV fallback when SES identities are not verified yet. */
+/** Local development only — activated when NODE_ENV=development and EMAIL_DRY_RUN=true. */
 export class DryRunEmailService implements EmailService {
   async sendContactNotification(payload: ContactEmailPayload): Promise<void> {
     console.log(
