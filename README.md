@@ -34,6 +34,7 @@ Solo nombres documentados. Valores en AWS Secrets Manager / SSM — **nunca en r
 | `CAPTCHA_SECRET` | Condicional | Secret de verificación |
 | `CRM_WEBHOOK_URL` | No | Webhook CRM opcional |
 | `LOG_LEVEL` | No | Nivel de log (`info` por defecto) |
+| `EMAIL_DRY_RUN` | No | `true` solo en local explícito; **false** en DEV/prod (R-001) |
 
 Ver `.env.example` para plantilla local.
 
