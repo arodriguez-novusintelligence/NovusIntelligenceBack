@@ -93,13 +93,12 @@ export function methodNotAllowedResponse(
 }
 
 export function corsHeaders(origin: string | undefined, allowedOrigins: string[]): Record<string, string> {
-  const allowAny = allowedOrigins.includes('*');
-  if (!origin || (!allowAny && !allowedOrigins.includes(origin))) {
+  if (!origin || !allowedOrigins.includes(origin)) {
     return {};
   }
 
   return {
-    'Access-Control-Allow-Origin': allowAny ? origin : origin,
+    'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'POST,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     Vary: 'Origin',

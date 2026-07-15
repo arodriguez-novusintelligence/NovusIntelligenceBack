@@ -15,6 +15,7 @@ provider:
     name: novus-intelligence-api-${self:provider.stage}
     cors:
       allowedOrigins:
+        - https://d1bfu6klutpp8m.cloudfront.net
         - https://dev.novusintelligence.com
         - http://localhost:5173
       allowedMethods:
@@ -31,7 +32,7 @@ provider:
     CONTACT_EMAIL_FROM: ${env:CONTACT_EMAIL_FROM, ''}
     CONTACT_EMAIL_TO: ${env:CONTACT_EMAIL_TO, ''}
     EMAIL_DRY_RUN: ${env:EMAIL_DRY_RUN, 'true'}
-    CORS_ALLOWED_ORIGINS: ${env:CORS_ALLOWED_ORIGINS, 'https://dev.novusintelligence.com,http://localhost:5173,*'}
+    CORS_ALLOWED_ORIGINS: ${env:CORS_ALLOWED_ORIGINS, 'https://d1bfu6klutpp8m.cloudfront.net,https://dev.novusintelligence.com,http://localhost:5173'}
     RATE_LIMIT_PER_IP: ${env:RATE_LIMIT_PER_IP, '10'}
     CAPTCHA_ENABLED: ${env:CAPTCHA_ENABLED, 'false'}
     CAPTCHA_PROVIDER: ${env:CAPTCHA_PROVIDER, 'turnstile'}
