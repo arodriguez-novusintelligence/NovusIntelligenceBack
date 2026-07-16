@@ -1,0 +1,122 @@
+openapi: 3.0.3
+info:
+  title: Novus Intelligence Contact API
+  version: 1.0.0
+  description: |
+    Contrato del endpoint de formulario de contacto corporativo.
+    Especificación NADF: especificacion-backend.md (novus-intelligence).
+servers:
+  - url: https://api-dev.novusintelligence.com
+    description: DEV (sa-east-1)
+paths:
+  /api/v1/contact:
+    post:
+      summary: Enviar formulario de contacto
+      operationId: submitContact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContactRequest'
+            example:
+              name: María García
+              company: Acme Corp
+              email: maria@acme.com
+              phone: "+57 300 123 4567"
+              message: Quiero conocer más sobre agentes de IA para mi empresa.
+              solutionInterest: ai-agents
+      responses:
+        '200':
+          description: Mensaje recibido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactResponse'
+              example:
+                ok: true
+                requestId: 550e8400-e29b-41d4-a716-446655440000
+                message: Mensaje recibido. Nos pondremos en contacto pronto.
+        '400':
+          description: Validación fallida
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactResponse'
+        '429':
+          description: Rate limit excedido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactResponse'
+        '500':
+          description: Error interno
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContactResponse'
+    options:
+      summary: CORS preflight
+      responses:
+        '200':
+          description: Preflight OK
+components:
+  schemas:
+    ContactRequest:
+      type: object
+      required: [name, email, message]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 120
+        company:
+          type: string
+          maxLength: 160
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        phone:
+          type: string
+          maxLength: 40
+        message:
+          type: string
+          minLength: 5
+          maxLength: 4000
+        solutionInterest:
+          type: string
+          enum:
+            - ai-agents
+            - automation
+            - integrations
+            - analytics
+            - documents-ai
+            - customer-ai
+        captchaToken:
+          type: string
+    ContactFieldError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+    ContactResponse:
+      type: object
+      required: [ok, requestId, message]
+      properties:
+        ok:
+          type: boolean
+        requestId:
+          type: string
+          format: uuid
+        message:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContactFieldError'
