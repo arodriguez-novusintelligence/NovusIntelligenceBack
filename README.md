@@ -67,7 +67,12 @@ API Gateway (HTTP API) → Lambda (novus-contact-handler) → SES
 - Validación y sanitización server-side según `especificacion-backend.md`.
 - Sin mocks en producción (R-001): `requestId` siempre UUID real.
 
+## Contrato OpenAPI
+
+- `openapi/contact-v1.yaml` — esquema `POST /api/v1/contact` alineado a `especificacion-backend.md`.
+
 ## Referencias NADF
 
 - Especificación: `.nadf/projects/novus-intelligence/artifacts/especificacion-backend.md`
 - Plan: `.nadf/projects/novus-intelligence/artifacts/plan-implementacion.md`
+- Resumen implementación: `.nadf/projects/novus-intelligence/artifacts/resumen-backend.md`

@@ -84,11 +84,11 @@ functions:
 
 resources:
   Resources:
-    ContactApiGatewayThrottleAlarm:
+    ContactHandlerErrorsAlarm:
       Type: AWS::CloudWatch::Alarm
       Properties:
         AlarmName: novus-contact-handler-errors-${self:provider.stage}
-        AlarmDescription: Lambda errors for novus-contact-handler
+        AlarmDescription: Lambda errors for novus-contact-handler (AC-08 observabilidad)
         Namespace: AWS/Lambda
         MetricName: Errors
         Dimensions:
