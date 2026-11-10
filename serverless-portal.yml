@@ -54,6 +54,11 @@ provider:
     NODE_ENV: ${sls:stage}
     PORTAL_TABLE:
       Ref: PortalTable
+    EVIDENCE_BUCKET:
+      Ref: EvidenceBucket
+    USER_POOL_ID:
+      Ref: PortalUserPool
+    RUNNER_PROJECT: nadf-runner-${sls:stage}
   iam:
     role:
       statements:
@@ -66,6 +71,21 @@ provider:
           Resource:
             - Fn::GetAtt: [PortalTable, Arn]
             - Fn::Join: ['', [{ 'Fn::GetAtt': [PortalTable, Arn] }, '/index/*']]
+        # Pipeline PROD: lanzar el ejecutor, firmar evidencias, verificar MFA y abrir la vista previa logueada.
+        - Effect: Allow
+          Action: codebuild:StartBuild
+          Resource: arn:aws:codebuild:${aws:region}:${aws:accountId}:project/nadf-runner-${sls:stage}
+        - Effect: Allow
+          Action: s3:GetObject
+          Resource:
+            Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/requests/*']]
+        - Effect: Allow
+          Action: cognito-idp:AdminGetUser
+          Resource:
+            Fn::GetAtt: [PortalUserPool, Arn]
+        - Effect: Allow
+          Action: secretsmanager:GetSecretValue
+          Resource: arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/*/web-app-user-*
 
 plugins:
   - serverless-esbuild
@@ -93,6 +113,20 @@ functions:
           method: get
           authorizer:
             name: portalJwt
+
+  portalRequests:
+    name: nadf-portal-requests-${sls:stage}
+    handler: src/portal/handlers/requests.handler
+    description: NADF — solicitudes, aprobación (MFA) y vista previa del pipeline PROD
+    memorySize: 512
+    timeout: 25
+    events:
+      - httpApi: { path: /api/v1/portal/apps, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/requests, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/requests, method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/requests/{id}', method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/requests/{id}/decision', method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/requests/{id}/preview-session', method: post, authorizer: { name: portalJwt } }
 
 resources:
   Resources:
@@ -360,6 +394,97 @@ resources:
                         - ':distribution/'
                         - Ref: PortalDistribution
 
+    # ---------- Ejecutor NADF (Claude Code headless en CodeBuild) ----------
+    RunnerLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /nadf/runner/${sls:stage}
+        RetentionInDays: 90
+
+    RunnerRole:
+      Type: AWS::IAM::Role
+      Properties:
+        # El prefijo nadf-runner- es el único que pueden usar los roles de despliegue de las empresas (trust + external ID).
+        RoleName: nadf-runner-portal-${sls:stage}
+        Description: NADF runner (CodeBuild) - desarrolla, publica vista previa y despliega tras aprobacion
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: codebuild.amazonaws.com }
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: nadf-runner
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [logs:CreateLogStream, logs:PutLogEvents]
+                  Resource:
+                    Fn::Join: ['', [{ 'Fn::GetAtt': [RunnerLogGroup, Arn] }, '*']]
+                - Effect: Allow
+                  Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                  Resource:
+                    Fn::GetAtt: [PortalTable, Arn]
+                - Effect: Allow
+                  Action: [s3:GetObject, s3:PutObject]
+                  Resource:
+                    Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/*']]
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource:
+                    - arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/platform/claude-api-key-*
+                    - arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/platform/github-app-*
+                    - arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/doevents/*
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: arn:aws:iam::${aws:accountId}:role/nadf-*-deploy-*
+
+    RunnerProject:
+      Type: AWS::CodeBuild::Project
+      Properties:
+        Name: nadf-runner-${sls:stage}
+        Description: NADF - pipeline PROD con revision (Claude Code headless)
+        ServiceRole:
+          Fn::GetAtt: [RunnerRole, Arn]
+        TimeoutInMinutes: 120
+        QueuedTimeoutInMinutes: 60
+        ConcurrentBuildLimit: 3
+        Artifacts: { Type: NO_ARTIFACTS }
+        LogsConfig:
+          CloudWatchLogs:
+            Status: ENABLED
+            GroupName: /nadf/runner/${sls:stage}
+        Environment:
+          Type: LINUX_CONTAINER
+          ComputeType: BUILD_GENERAL1_LARGE
+          Image: aws/codebuild/standard:7.0
+          EnvironmentVariables:
+            - { Name: PORTAL_TABLE, Value: { Ref: PortalTable } }
+            - { Name: EVIDENCE_BUCKET, Value: { Ref: EvidenceBucket } }
+            - { Name: CLAUDE_MODEL, Value: claude-opus-5-5 }
+            - { Name: CLAUDE_BUDGET_USD, Value: '25' }
+            - Name: PORTAL_ORIGINS
+              Value: https://portal.novusintelligencesolutions.com,http://localhost:5174,${env:PORTAL_EXTRA_ORIGIN, 'http://127.0.0.1:5174'}
+        Source:
+          Type: NO_SOURCE
+          BuildSpec: |
+            version: 0.2
+            env:
+              shell: bash
+            phases:
+              install:
+                runtime-versions:
+                  nodejs: 20
+                commands:
+                  - aws s3 cp "s3://${EVIDENCE_BUCKET}/runner/runner.tgz" /tmp/runner.tgz --quiet
+                  - mkdir -p /opt/nadf && tar -xzf /tmp/runner.tgz -C /opt/nadf
+                  - cd /opt/nadf && npm ci --no-audit --no-fund --loglevel=error
+                  - npm install -g @anthropic-ai/claude-code@2.1.322 --no-audit --no-fund --loglevel=error
+              build:
+                commands:
+                  - node /opt/nadf/run.mjs
+
     PortalMeErrorsAlarm:
       Type: AWS::CloudWatch::Alarm
       Properties:
@@ -390,6 +515,8 @@ resources:
       Value: { Ref: PortalSiteBucket }
     PortalDistributionId:
       Value: { Ref: PortalDistribution }
+    RunnerProjectName:
+      Value: { Ref: RunnerProject }
     PortalDistributionDomain:
       Value:
         Fn::GetAtt: [PortalDistribution, DomainName]

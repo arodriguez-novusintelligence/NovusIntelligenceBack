@@ -1,0 +1,17 @@
+{
+  "name": "nadf-runner",
+  "private": true,
+  "type": "module",
+  "description": "Ejecutor NADF (CodeBuild): desarrolla con Claude Code, publica vista previa y despliega a PROD tras aprobación",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@aws-sdk/client-cloudfront": "^3.758.0",
+    "@aws-sdk/client-cloudtrail": "^3.758.0",
+    "@aws-sdk/client-dynamodb": "^3.758.0",
+    "@aws-sdk/client-s3": "^3.758.0",
+    "@aws-sdk/client-secrets-manager": "^3.758.0",
+    "@aws-sdk/client-sts": "^3.758.0",
+    "@aws-sdk/lib-dynamodb": "^3.758.0",
+    "playwright": "1.49.1"
+  }
+}
