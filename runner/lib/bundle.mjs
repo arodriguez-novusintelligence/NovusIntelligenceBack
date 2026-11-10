@@ -101,7 +101,8 @@ export function previewIndex(indexHtml, allowedOrigins) {
       if(e.data.token&&e.data.userId) setSession(e.data);
       boot();
     });
-    try{ ALLOWED.forEach(function(o){ window.parent.postMessage({type:'nadf-preview-ready'},o); }); }catch(e){}
+    var host=ALLOWED.filter(function(o){ return (document.referrer||'').indexOf(o)===0; })[0];
+    try{ if(host){ window.parent.postMessage({type:'nadf-preview-ready'},host); } }catch(e){}
     setTimeout(boot,8000);
   } else { boot(); }
 })();
