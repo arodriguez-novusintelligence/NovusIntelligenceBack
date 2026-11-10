@@ -140,6 +140,35 @@ function promptOf(req, id) {
   return company?.instructions ? `${base}\n\n## Instrucciones de la empresa (v${company.version})\n${company.instructions}` : base;
 }
 
+/** Cuerpo del PR (lo usan develop y la continuación tras aceptar un riesgo). */
+function prBodyOf(req, report, tests, note = '') {
+  const list = (items) => (items?.length ? items.map((i) => `- ${i}`).join('\n') : '- (nada)');
+  return [
+    `**Solicitud NADF** \`${cfg.requestId}\` · iteración ${req.iteration} · perfil ${req.workflow?.profile} · pedida por ${req.createdBy?.name ?? req.createdBy?.email}`,
+    '',
+    '> ' + req.prompt.split('\n').join('\n> '),
+    '',
+    `### Resumen\n${report?.resumen ?? ''}`,
+    `### Hecho\n${list(report?.hecho)}`,
+    `### No hecho\n${list(report?.no_hecho)}`,
+    `### Limitaciones\n${list(report?.limitaciones)}`,
+    `### Pruebas\n${(tests ?? []).map((t) => `- ${t.status === 'passed' ? '✅' : t.status === 'failed' ? '❌' : t.status === 'warning' ? '⚠️' : '⏭️'} ${t.name}${t.detail ? ` — ${t.detail}` : ''}`).join('\n')}`,
+    note ? `\n### Riesgo aceptado\n${note}` : '',
+    '',
+    'Se despliega a PROD **solo** cuando un aprobador lo autoriza en el portal NADF (con verificación en dos pasos). NADF hace el merge después del despliegue.',
+    '',
+    '🤖 Generated with [Claude Code](https://claude.com/claude-code)',
+  ].join('\n');
+}
+
+async function openPr({ ghToken, branch, title, body }) {
+  const { owner, name, defaultBranch } = cfg.app.repo;
+  const existing = await api(`/repos/${owner}/${name}/pulls?state=open&head=${owner}:${encodeURIComponent(branch)}`, ghToken);
+  return existing.length
+    ? api(`/repos/${owner}/${name}/pulls/${existing[0].number}`, ghToken, { method: 'PATCH', body: { title: `NADF: ${title}`, body } })
+    : api(`/repos/${owner}/${name}/pulls`, ghToken, { method: 'POST', body: { title: `NADF: ${title}`, head: branch, base: defaultBranch, body } });
+}
+
 const planned = (req, id) => req.workflow?.nodes?.find((n) => n.id === id);
 const willRun = (req, id) => planned(req, id)?.planned === 'run' || planned(req, id)?.planned === 'conditional';
 const rulesOf = (req, id) => req.rules?.nodes?.[id] ?? { mandatory: [], configurable: [] };
@@ -215,6 +244,10 @@ async function plan() {
     return { text: `Clasificado: ${data.changeTypes.join(', ') || 'sin tipo'} · riesgo ${data.riesgo}.`, output: data, metrics, ioKey, data };
   });
   const signals = classification.data;
+  if (req.scopeOverride === 'web_only' && signals.backendRequired) {
+    signals.backendRequired = false;
+    await state.emit('info', 'Alcance acordado: solo la parte web (decisión registrada). La dependencia de backend queda documentada en el informe.', { nodeId: 'orchestrator' });
+  }
 
   const { decideComplexity } = await import('./vendor/routing.mjs');
   const decision = await step('complexity-router', 'El Complexity Router elige el perfil mínimo suficiente.', async () => {
@@ -380,7 +413,10 @@ async function develop() {
       ruleText(rulesOf(req, 'frontend-integration-agent')),
       `- AL TERMINAR escribe nadf-report.json en la raíz del repo con este formato (JSON válido, en español): ${JSON.stringify(reportSchema)}`,
       '- En "rutas_a_revisar" pon hasta 4 rutas (path) donde el aprobador ve el cambio; la vista previa abre logueada con un usuario admin.',
-    ].join('\n');
+      req.scopeOverride === 'web_only'
+        ? '- ALCANCE ACORDADO: solo la web. Si algo depende de cambios de backend que no existen, protégelo con un feature flag APAGADO por defecto para no romper producción, y explica en "no_hecho" qué falta en el backend.'
+        : '',
+    ].filter(Boolean).join('\n');
     const system = `${promptOf(req, 'frontend-integration-agent')}\n\n${instructions}`;
     const feedback = (req.feedback ?? []).map((f) => `- ${f.by?.name ?? f.by?.email ?? 'Revisor'}: ${f.text}`).join('\n');
     const prompt = [
@@ -509,16 +545,53 @@ async function develop() {
       }),
     );
   }
+  const title = (report.titulo || req.title || req.prompt.split('\n')[0]).slice(0, 90);
+  async function commitAndPush(emit) {
+    await git(['add', '-A', '--', ...files.map((f) => f.replace(/\/$/, ''))]);
+    const hasStaged = (await run('git', ['diff', '--cached', '--quiet'], { cwd: repoDir, quiet: true })).code !== 0;
+    if (hasStaged) {
+      await git(['-c', 'user.name=NADF · Novus Intelligence', '-c', 'user.email=nadf@novusintelligencesolutions.com', 'commit', '-m', `nadf: ${title}\n\nSolicitud ${cfg.requestId} (iteración ${cfg.iteration}) desde el portal NADF.\nPedida por: ${req.createdBy?.name ?? req.createdBy?.email}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`]);
+    }
+    if (emit) await emit('tool', `GitHub (conector NADF): push ${branch}`);
+    await git([...auth, 'push', 'origin', `HEAD:refs/heads/${branch}`], { errorCode: 'REPO_PUSH_DENIED' });
+    return { diffStat: (await git(['diff', '--stat', `origin/${defaultBranch}...HEAD`])).out.trim().split('\n').slice(-12).join('\n'), headSha: (await git(['rev-parse', 'HEAD'])).out.trim() };
+  }
+  const reviewState = () => ({ title, report, tests, screenshots, previewUrl, branch, baseSha, prodEtag: prod.index.etag, previewEntry: entryScripts(builtIndex), changedFiles: files, costUsd: Math.round(((req.costUsd ?? 0) + (claude?.costUsd ?? 0)) * 100) / 100 });
+  /** Bloqueo de revisión: se guarda el trabajo en la rama (sin PR) para corregir o aceptar el riesgo sin rehacerlo. */
+  async function park(stop) {
+    if (!['REVIEW_BLOCKED', 'SECURITY_REVIEW_BLOCKED'].includes(stop?.code)) return;
+    try {
+      const pushed = await commitAndPush();
+      await state.update({ ...reviewState(), ...pushed, parked: { code: stop.code, nodeId: stop.code === 'REVIEW_BLOCKED' ? 'reviewer-agent' : 'security-agent', at: new Date().toISOString(), findings: stop.extra?.output ?? null } }, ['developing']);
+      await state.emit('info', `El trabajo quedó guardado en la rama ${branch} (sin PR) para que decidas: corregir con la IA o aceptar el riesgo y continuar.`);
+    } catch (error) {
+      console.error('No se pudo guardar el trabajo bloqueado', error.message);
+    }
+  }
+
   const settled = await Promise.allSettled(branches);
   const rejected = settled.find((s) => s.status === 'rejected');
   if (rejected) {
     await skipRest(req, ['reviewer-agent', 'pull-request', 'human-approval', 'release', 'prod-verification'], 'No se ejecuta: una validación anterior no pasó.');
+    await park(rejected.reason);
     throw rejected.reason;
   }
 
   if (willRun(req, 'reviewer-agent')) {
     const def = agentDefinition('reviewer-agent');
     await step('reviewer-agent', 'El Revisor compara el cambio con los criterios de aceptación.', async (emit) => {
+      try {
+        return await reviewerRun(emit);
+      } catch (error) {
+        await skipRest(req, ['pull-request', 'human-approval', 'release', 'prod-verification'], 'No se ejecuta: el Revisor bloqueó el cambio.');
+        await park(error);
+        throw error;
+      }
+    });
+  }
+  async function reviewerRun(emit) {
+    const def = agentDefinition('reviewer-agent');
+    {
       const system = `${promptOf(req, 'reviewer-agent')}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'reviewer-agent'))}\n${reviewPolicy}\nResponde solo con el JSON pedido, en español.`;
       const user = `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}\n\nDiff:\n${diff}`;
       const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review });
@@ -526,22 +599,15 @@ async function develop() {
       const ioKey = await saveIo('reviewer-agent', { prompt: { base: def.prompt, instrucciones: ruleText(rulesOf(req, 'reviewer-agent')), solicitud: req.prompt, contexto: { criterios: criteria } }, input: { archivos: files }, output: data });
       if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'REVIEW_BLOCKED', `El Revisor bloqueó el cambio: ${data.resumen}`, { metrics, output: data, ioKey });
       return { text: `Veredicto: ${data.veredicto.replace('_', ' ')}.`, output: data, metrics, ioKey };
-    });
+    }
   }
 
   // ---- Pull request.
   let pr;
   let diffStat = '';
-  const title = (report.titulo || req.title || req.prompt.split('\n')[0]).slice(0, 90);
+  let headSha = '';
   await step('pull-request', 'Guardando el cambio en una rama y abriendo el pull request.', async (emit) => {
-    await git(['add', '-A', '--', ...files.map((f) => f.replace(/\/$/, ''))]);
-    const hasStaged = (await run('git', ['diff', '--cached', '--quiet'], { cwd: repoDir, quiet: true })).code !== 0;
-    if (hasStaged) {
-      await git(['-c', 'user.name=NADF · Novus Intelligence', '-c', 'user.email=nadf@novusintelligencesolutions.com', 'commit', '-m', `nadf: ${title}\n\nSolicitud ${cfg.requestId} (iteración ${cfg.iteration}) desde el portal NADF.\nPedida por: ${req.createdBy?.name ?? req.createdBy?.email}\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`]);
-    }
-    await emit('tool', `GitHub (conector NADF): push ${branch}`);
-    await git([...auth, 'push', 'origin', `HEAD:refs/heads/${branch}`], { errorCode: 'REPO_PUSH_DENIED' });
-    diffStat = (await git(['diff', '--stat', `origin/${defaultBranch}...HEAD`])).out.trim().split('\n').slice(-12).join('\n');
+    ({ diffStat, headSha } = await commitAndPush(emit));
     const list = (items) => (items?.length ? items.map((i) => `- ${i}`).join('\n') : '- (nada)');
     const prBody = [
       `**Solicitud NADF** \`${cfg.requestId}\` · iteración ${cfg.iteration} · perfil ${req.workflow.profile} · pedida por ${req.createdBy?.name ?? req.createdBy?.email}`,
@@ -579,7 +645,7 @@ async function develop() {
     prNumber: pr.number,
     branch,
     baseSha,
-    headSha: (await git(['rev-parse', 'HEAD'])).out.trim(),
+    headSha,
     prodEtag: prod.index.etag,
     previewEntry: entryScripts(builtIndex),
     diffStat,
@@ -587,6 +653,28 @@ async function develop() {
     costUsd: Math.round(((req.costUsd ?? 0) + (claude?.costUsd ?? 0)) * 100) / 100,
   }, ['developing']);
   await state.nodeSet('human-approval', NODE.WAITING_APPROVAL, `Listo para revisión. PR #${pr.number}. Abre la vista previa y decide.`);
+}
+
+// ---------------------------------------------------------------- continue (riesgo aceptado por un aprobador)
+
+async function continueAfterRisk() {
+  const req = await state.get();
+  if (!(await state.update({ stage: 'continuing' }, ['continuing']))) return console.log('La solicitud no está para continuar; se ignora.');
+  const ra = req.riskAcceptance;
+  const ghApp = await secret('/nadf/platform/github-app', true);
+  const ghToken = await installationToken(ghApp, cfg.app.repo.installationId, cfg.app.repo.name);
+  const who = ra?.by?.name ?? ra?.by?.email;
+  await state.nodeSet(ra.nodeId, NODE.COMPLETED, `Bloqueo aceptado por ${who}: ${ra.justification}`);
+  if (ra.nodeId === 'security-agent' && planned(req, 'reviewer-agent')) await state.nodeSet('reviewer-agent', NODE.SKIPPED, 'No se ejecutó: el aprobador aceptó el riesgo tras el bloqueo de Seguridad.');
+  let pr;
+  await step('pull-request', 'Abriendo el pull request con el riesgo aceptado documentado.', async (emit) => {
+    await emit('tool', 'GitHub (conector NADF): abrir pull request desde la rama guardada');
+    const note = `${who} aceptó el bloqueo de ${ra.nodeId === 'reviewer-agent' ? 'el Revisor' : 'Seguridad'} el ${ra.at}.\n\n> ${ra.justification}\n\nHallazgos: ${ra.findings ?? '—'}`;
+    pr = await openPr({ ghToken, branch: req.branch, title: req.title ?? req.requestId, body: prBodyOf(req, req.report, req.tests, note) });
+    return { text: `PR #${pr.number} listo (riesgo aceptado).`, output: { prUrl: pr.html_url, prNumber: pr.number } };
+  });
+  await state.update({ status: 'awaiting_approval', stage: 'awaiting_approval', prUrl: pr.html_url, prNumber: pr.number, error: null }, ['continuing']);
+  await state.nodeSet('human-approval', NODE.WAITING_APPROVAL, `Riesgo aceptado por ${who}. PR #${pr.number}: falta la aprobación del despliegue a PROD.`);
 }
 
 // ---------------------------------------------------------------- deploy
@@ -786,6 +874,7 @@ try {
   else if (cfg.phase === 'develop') await develop();
   else if (cfg.phase === 'deploy') await deploy();
   else if (cfg.phase === 'rollback') await rollback();
+  else if (cfg.phase === 'continue') await continueAfterRisk();
   else throw new Error(`Fase desconocida: ${cfg.phase}`);
 } catch (error) {
   const stop = error instanceof Stop ? error : new Stop('failed', error.code ?? 'RUNNER_ERROR', 'Ocurrió un error inesperado en el agente.');
@@ -796,7 +885,7 @@ try {
   if (stop.extra?.tail || error.tail) await state.emit('info', `Detalle técnico:\n${String(stop.extra?.tail ?? error.tail).slice(-1500)}`);
   // Un rollback fallido deja la solicitud desplegada (PROD no se tocó o se restauró parcialmente: se informa).
   const finalStatus = cfg.phase === 'rollback' ? 'deployed' : stop.status;
-  const phaseStatus = { plan: ['planning'], develop: ['developing', 'queued'], deploy: ['deploying', 'approved'], rollback: ['rolling_back', 'rollback_approved'] }[cfg.phase];
+  const phaseStatus = { plan: ['planning'], develop: ['developing', 'queued'], deploy: ['deploying', 'approved'], rollback: ['rolling_back', 'rollback_approved'], continue: ['continuing'] }[cfg.phase];
   const ok = await state.update({ status: finalStatus, stage: finalStatus, error: { code: stop.code, message: stop.message }, tests: tests.length ? tests : undefined }, phaseStatus);
   if (!ok) console.error('No se pudo actualizar el estado final');
   process.exitCode = 1;

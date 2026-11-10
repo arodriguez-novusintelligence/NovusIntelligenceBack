@@ -141,3 +141,8 @@ test('ajuste visual: ningún agente opcional y presupuesto mínimo', () => {
   for (const id of ['planner-agent', 'architect-agent', 'security-agent', 'reviewer-agent']) assert.equal(node(p, id).planned, 'skip', id);
   assert.equal(p.policy.budgetUsd, 3);
 });
+
+test('modelo de desarrollo por naturaleza: Sonnet para ajustes visuales, Opus para el resto', () => {
+  assert.equal(planWith(sig({ naturaleza: 'ajuste_visual', changeTypes: ['color'] })).policy.models.development, 'claude-sonnet-5-5');
+  assert.equal(planWith(sig()).policy.models.development, 'claude-opus-5-5');
+});

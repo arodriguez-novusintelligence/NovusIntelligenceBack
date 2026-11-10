@@ -5,6 +5,7 @@ import { errorResponse, json, log } from '../lib/http';
 import { principalFromClaims, type Principal } from '../lib/principal';
 import { createDynamoRepository, type PortalRepository } from '../lib/repository';
 import {
+  ACCEPTABLE_BLOCKS,
   ATTACHMENT_TYPES,
   MAX_ATTACHMENT_BYTES,
   MAX_ATTACHMENTS,
@@ -29,7 +30,7 @@ export interface PreviewSession {
   platformRole?: string;
 }
 
-export type RunPhase = 'plan' | 'develop' | 'deploy' | 'rollback';
+export type RunPhase = 'plan' | 'develop' | 'deploy' | 'rollback' | 'continue';
 
 export interface RequestServices {
   /** Lanza el ejecutor NADF (CodeBuild) para una fase. Devuelve el id de la ejecución. */
@@ -307,14 +308,14 @@ export function createRequestsHandler(
   async function decide(ctx: Ctx, event: Event, id: string) {
     const input = body(event);
     const decision = input.decision as Decision;
-    if (!['approve', 'reject', 'changes', 'approve_rollback', 'reject_rollback'].includes(decision)) {
+    if (!['approve', 'reject', 'changes', 'approve_rollback', 'reject_rollback', 'accept_risk', 'web_only'].includes(decision)) {
       return errorResponse(400, ctx.requestId, 'INVALID_DECISION', 'Decisión no válida.');
     }
     const comment = typeof input.comment === 'string' ? input.comment.trim().slice(0, 4000) : '';
     const r = await load(ctx, id);
     if (!r) return notFound(ctx);
 
-    if (decision !== 'changes') {
+    if (decision !== 'changes' && decision !== 'web_only') {
       if (!can(ctx, 'approvals.decide')) return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Solo un aprobador puede tomar esta decisión.');
     } else if (!can(ctx, 'approvals.decide') && !isOwner(ctx, r)) {
       return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Tu rol no permite pedir ajustes sobre esta solicitud.');
@@ -323,9 +324,40 @@ export function createRequestsHandler(
     if (decision === 'changes' && r.status === 'awaiting_approval' && !comment) {
       return errorResponse(400, ctx.requestId, 'COMMENT_REQUIRED', 'Cuéntale al agente qué ajustar.');
     }
-    if (decision === 'approve' || decision === 'approve_rollback') {
+    if (decision === 'approve' || decision === 'approve_rollback' || decision === 'accept_risk') {
       const mfa = await requireMfa(ctx);
       if (mfa) return mfa;
+    }
+
+    const at0 = now().toISOString();
+    // Aceptar el riesgo de un bloqueo de revisión: queda documentado y aún hace falta aprobar el despliegue a PROD.
+    if (decision === 'accept_risk') {
+      const code = r.error?.code ?? '';
+      if (!ACCEPTABLE_BLOCKS.includes(code)) {
+        return errorResponse(409, ctx.requestId, 'NOT_ACCEPTABLE', 'Este bloqueo no se puede aceptar: protege a PROD o a los datos. Corrígelo o reintenta.');
+      }
+      if (!r.parked) return errorResponse(409, ctx.requestId, 'NOT_PARKED', 'Este bloqueo ocurrió antes de que NADF guardara el trabajo. Usa «Corregir con la IA» o «Reintentar».');
+      if (comment.length < 15) return errorResponse(400, ctx.requestId, 'JUSTIFICATION_REQUIRED', 'Explica por qué aceptas el riesgo (mínimo 15 caracteres): queda en la auditoría y en el PR.');
+      const findings = r.error?.message ?? '';
+      const next: Partial<RequestRecord> = { status: 'continuing', stage: 'continuing', riskAcceptance: { by: ctx.actor, at: at0, justification: comment, code, nodeId: r.parked.nodeId, findings }, updatedAt: at0 };
+      const ok = await requests.transition(r.companyId, r.requestId, ['blocked'], next);
+      if (!ok) return conflict(ctx);
+      await addEvent(r.requestId, `${who(ctx.actor)} aceptó el riesgo del bloqueo (${code === 'REVIEW_BLOCKED' ? 'Revisor' : 'Seguridad'}) con verificación en dos pasos: ${comment}`, 'warning', { nodeId: r.parked.nodeId, eventType: 'RISK_ACCEPTED' });
+      const failed = await launch(ctx, { ...r, ...next } as RequestRecord, 'continue');
+      return failed ?? json(200, { ok: true, requestId: ctx.requestId, status: 'continuing' });
+    }
+    // Plan detenido porque pide capas no conectadas: continuar solo con la parte web (re-planifica con ese alcance).
+    if (decision === 'web_only') {
+      if (r.error?.code !== 'PLAN_BLOCKED' || !/backend/i.test(r.workflow?.blockReason ?? r.error?.message ?? '')) {
+        return errorResponse(409, ctx.requestId, 'NOT_APPLICABLE', 'Esta opción solo aplica cuando el plan se detuvo por necesitar backend.');
+      }
+      const feedback = [...(r.feedback ?? []), { at: at0, by: ctx.actor, text: comment || 'Continuar solo con la parte web.' }];
+      const next: Partial<RequestRecord> = { status: 'planning', stage: 'planning', scopeOverride: 'web_only', feedback, error: null, updatedAt: at0 };
+      const ok = await requests.transition(r.companyId, r.requestId, ['blocked'], next);
+      if (!ok) return conflict(ctx);
+      await addEvent(r.requestId, `${who(ctx.actor)} decidió continuar solo con la parte web${comment ? `: ${comment}` : '.'}`, 'stage', { eventType: 'SCOPE_WEB_ONLY' });
+      const failed = await launch(ctx, { ...r, ...next } as RequestRecord, 'plan');
+      return failed ?? json(200, { ok: true, requestId: ctx.requestId, status: 'planning' });
     }
 
     const at = now().toISOString();

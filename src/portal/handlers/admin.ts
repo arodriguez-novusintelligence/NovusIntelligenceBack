@@ -282,11 +282,12 @@ export function createAdminHandler(repo: PortalRepository, store: AdminStore, re
     const byStatus: Record<string, number> = {};
     for (const r of all) byStatus[r.status] = (byStatus[r.status] ?? 0) + 1;
     const decisions = all
-      .filter((r) => r.decision || r.planApproval || r.rollback)
+      .filter((r) => r.decision || r.planApproval || r.rollback || r.riskAcceptance)
       .flatMap((r) => [
         ...(r.planApproval ? [{ at: r.planApproval.at, by: r.planApproval.by, action: 'plan.approved', detail: { requestId: r.requestId, title: r.title } }] : []),
         ...(r.decision ? [{ at: r.decision.at, by: r.decision.by, action: `deploy.${r.decision.decision}`, detail: { requestId: r.requestId, title: r.title } }] : []),
         ...(r.rollback ? [{ at: r.rollback.requestedAt, by: r.rollback.requestedBy, action: 'rollback.requested', detail: { requestId: r.requestId, title: r.title } }] : []),
+        ...(r.riskAcceptance ? [{ at: r.riskAcceptance.at, by: r.riskAcceptance.by, action: 'risk.accepted', detail: { requestId: r.requestId, title: r.title, justification: r.riskAcceptance.justification } }] : []),
       ]);
     return json(200, {
       ok: true,

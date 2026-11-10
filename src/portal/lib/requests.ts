@@ -32,9 +32,14 @@ export type RequestStatus =
   | 'rollback_approved'
   | 'rolling_back'
   | 'stopped'
-  | 'cancelled';
+  | 'cancelled'
+  | 'continuing';
 
-export type Decision = 'approve' | 'reject' | 'changes' | 'approve_rollback' | 'reject_rollback';
+export type Decision = 'approve' | 'reject' | 'changes' | 'approve_rollback' | 'reject_rollback' | 'accept_risk' | 'web_only';
+
+/** Bloqueos que un aprobador puede aceptar (con MFA y justificación) y los que nunca se omiten. */
+export const ACCEPTABLE_BLOCKS = ['REVIEW_BLOCKED', 'SECURITY_REVIEW_BLOCKED'];
+export const NON_OVERRIDABLE_BLOCKS = ['PROD_DIFFERS_FROM_MAIN', 'PROD_CHANGED', 'MAIN_CHANGED', 'SECRET_IN_DIFF'];
 
 export type NodeStatus =
   | 'PENDING'
@@ -188,6 +193,10 @@ export interface RequestRecord {
   /** Archivos que complementan la solicitud (imágenes, .md, .txt, .docx). */
   attachments?: Attachment[];
   stopped?: { by: Actor; at: string; reason?: string; previousStatus: RequestStatus };
+  /** Trabajo guardado en la rama cuando un revisor bloquea (permite aceptar el riesgo sin rehacer). */
+  parked?: { code: string; nodeId: string; at: string; findings?: unknown };
+  riskAcceptance?: { by: Actor; at: string; justification: string; code: string; nodeId: string; findings?: string };
+  scopeOverride?: 'web_only';
   cancelled?: { by: Actor; at: string; reason?: string };
   rollback?: { requestedBy: Actor; requestedAt: string; reason: string; risks: string[]; approvedBy?: Actor; approvedAt?: string; rejectedBy?: Actor; finishedAt?: string; smoke?: TestResult[]; revertPrUrl?: string | null };
   headSha?: string;
@@ -356,6 +365,7 @@ export function createRequestRepository(tableName: string, client?: DynamoDBDocu
 export function decisionAllowed(status: RequestStatus, decision: Decision): boolean {
   if (decision === 'approve') return status === 'awaiting_approval';
   if (decision === 'approve_rollback' || decision === 'reject_rollback') return status === 'rollback_requested';
+  if (decision === 'accept_risk' || decision === 'web_only') return status === 'blocked';
   if (decision === 'reject') return status === 'awaiting_approval' || status === 'no_changes' || status === 'blocked' || status === 'failed';
   // Pedir ajustes / reintentar: tras el informe, si no hubo cambios, si PROD cambió o si algo falló.
   return ['awaiting_approval', 'no_changes', 'blocked', 'failed', 'rolled_back'].includes(status);

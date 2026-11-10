@@ -80,7 +80,7 @@ export function policyDecision(signals = {}, policy = agentPolicy()) {
     motivoCritico: signals.motivo_critico || null,
     agents: [...agents],
     adrRequired: (policy.adr?.required_when ?? []).includes(n),
-    models: policy.models ?? {},
+    models: { analysis: policy.models?.analysis, development: policy.models?.development_by_naturaleza?.[n] ?? policy.models?.development },
     budgetUsd: policy.development_budget_usd?.[n] ?? null,
     limits: policy.context_limits ?? {},
     reviewer: policy.reviewer ?? {},

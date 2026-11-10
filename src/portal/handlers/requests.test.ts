@@ -452,3 +452,55 @@ describe('adjuntos de la solicitud', () => {
     expect(parse(await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el banner del inicio', attachments: many } }))).code).toBe('TOO_MANY_FILES');
   });
 });
+
+describe('decisiones sobre bloqueos', () => {
+  const parked = { code: 'REVIEW_BLOCKED', nodeId: 'reviewer-agent', at: 'x' };
+  const reviewBlock = { error: { code: 'REVIEW_BLOCKED', message: 'El Revisor bloqueó el cambio: falta backend' }, parked };
+
+  it('un aprobador acepta el riesgo con MFA y justificación; sigue a PR y aprobación', async () => {
+    const repo = seeded('blocked', reviewBlock);
+    const svc = services();
+    const h = createRequestsHandler(portalRepo, repo, svc);
+    const short = await h(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, body: { decision: 'accept_risk', comment: 'ok' } }));
+    expect(parse(short).code).toBe('JUSTIFICATION_REQUIRED');
+    const res = await h(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, body: { decision: 'accept_risk', comment: 'El backend se despliega mañana con feature flag apagado' } }));
+    expect(parse(res).status).toBe('continuing');
+    expect(repo.items.get(ID)?.riskAcceptance).toMatchObject({ nodeId: 'reviewer-agent', code: 'REVIEW_BLOCKED' });
+    expect(svc.startRun).toHaveBeenLastCalledWith(expect.anything(), 'continue');
+    expect(repo.log.some((e) => e.eventType === 'RISK_ACCEPTED')).toBe(true);
+  });
+
+  it('aceptar riesgo exige MFA y rol de aprobador', async () => {
+    const noMfa = createRequestsHandler(portalRepo, seeded('blocked', reviewBlock), services({ mfaEnabled: vi.fn(async () => false) }));
+    expect(parse(await noMfa(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, body: { decision: 'accept_risk', comment: 'Justificación suficiente aquí' } }))).code).toBe('MFA_REQUIRED');
+    const func = createRequestsHandler(portalRepo, seeded('blocked', reviewBlock), services());
+    expect(status(await func(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, groups: '[funcional]', sub: 'f1', body: { decision: 'accept_risk', comment: 'Justificación suficiente aquí' } })))).toBe(403);
+  });
+
+  it('nunca se acepta un bloqueo que protege PROD o los secretos', async () => {
+    for (const code of ['PROD_DIFFERS_FROM_MAIN', 'SECRET_IN_DIFF']) {
+      const h = createRequestsHandler(portalRepo, seeded('blocked', { error: { code, message: 'x' }, parked }), services());
+      expect(parse(await h(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, body: { decision: 'accept_risk', comment: 'Quiero continuar de todos modos' } }))).code).toBe('NOT_ACCEPTABLE');
+    }
+  });
+
+  it('bloqueos anteriores sin trabajo guardado: no se acepta, se corrige o reintenta', async () => {
+    const h = createRequestsHandler(portalRepo, seeded('blocked', { error: reviewBlock.error }), services());
+    expect(parse(await h(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, body: { decision: 'accept_risk', comment: 'Quiero continuar de todos modos' } }))).code).toBe('NOT_PARKED');
+  });
+
+  it('plan detenido por backend: continuar solo con la parte web re-planifica con ese alcance', async () => {
+    const repo = seeded('blocked', { workflow: { ...WF, blocked: true, blockReason: 'El pedido necesita cambios en el backend…' }, error: { code: 'PLAN_BLOCKED', message: 'x' } });
+    const svc = services();
+    const h = createRequestsHandler(portalRepo, repo, svc);
+    const res = await h(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, groups: '[funcional]', sub: 'f1', body: { decision: 'web_only', comment: 'Solo la pantalla, con feature flag' } }));
+    expect(parse(res).status).toBe('planning');
+    expect(repo.items.get(ID)?.scopeOverride).toBe('web_only');
+    expect(svc.startRun).toHaveBeenLastCalledWith(expect.anything(), 'plan');
+  });
+
+  it('«solo web» no aplica a otros bloqueos', async () => {
+    const h = createRequestsHandler(portalRepo, seeded('blocked', reviewBlock), services());
+    expect(parse(await h(ev('POST /api/v1/portal/requests/{id}/decision', { id: ID, body: { decision: 'web_only' } }))).code).toBe('NOT_APPLICABLE');
+  });
+});
