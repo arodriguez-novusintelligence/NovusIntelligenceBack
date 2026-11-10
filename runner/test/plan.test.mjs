@@ -165,3 +165,11 @@ test('revisión combinada: un esquema con los dos veredictos', async () => {
   assert.deepEqual(SCHEMAS.combinedReview.properties.seguridad.required, ['veredicto', 'hallazgos', 'resumen']);
   assert.ok(SCHEMAS.classification.required.includes('archivos_candidatos'));
 });
+
+test('costo de una llamada con la tarifa oficial', async () => {
+  const { costOf } = await import('../lib/llm.mjs');
+  const price = { input: 4, cache_write: 5, cache_read: 0.2, output: 20 };
+  assert.equal(costOf({ input_tokens: 1_000_000, output_tokens: 100_000 }, price), 6);
+  assert.equal(costOf({ input_tokens: 0, cache_read_input_tokens: 1_000_000, cache_creation_input_tokens: 200_000, output_tokens: 0 }, price), 1.2);
+  assert.equal(costOf({ input_tokens: 10 }, null), null);
+});

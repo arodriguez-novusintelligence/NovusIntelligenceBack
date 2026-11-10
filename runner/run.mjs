@@ -215,7 +215,7 @@ async function plan() {
   } catch (error) {
     console.error('Sin mapa del repo (se sigue sin él):', error.message);
   }
-  const llm = createLlm({ apiKey: claudeKey, model: policy?.models?.analysis ?? cfg.model });
+  const llm = createLlm({ apiKey: claudeKey, model: policy?.models?.analysis ?? cfg.model, pricing: policy?.pricing ?? {} });
   state.initNodes({});
   await state.update({ nodeState: {} });
 
@@ -321,7 +321,7 @@ async function develop() {
   const devBudget = pol?.budgetUsd ?? cfg.budgetUsd;
   const diffLimit = pol?.limits?.diff_chars ?? 90_000;
   const fileLimit = pol?.limits?.repo_file_list ?? 1500;
-  const llm = createLlm({ apiKey: claudeKey, model: analysisModel });
+  const llm = createLlm({ apiKey: claudeKey, model: analysisModel, pricing: agentPolicy()?.pricing ?? {} });
   const { owner, name, defaultBranch, installationId } = cfg.app.repo;
   const ghToken = await installationToken(ghApp, installationId, name);
   const auth = gitAuthArgs(ghToken);

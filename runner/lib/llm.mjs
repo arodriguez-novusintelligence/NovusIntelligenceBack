@@ -2,7 +2,19 @@
 // Salida JSON estructurada; devuelve también uso de tokens para las métricas del nodo.
 import Anthropic from '@anthropic-ai/sdk';
 
-export function createLlm({ apiKey, model }) {
+/** Costo de una llamada con la tarifa oficial (USD por millón de tokens). */
+export function costOf(usage, price) {
+  if (!price || !usage) return null;
+  const usd =
+    ((usage.input_tokens ?? 0) * price.input +
+      (usage.cache_creation_input_tokens ?? 0) * price.cache_write +
+      (usage.cache_read_input_tokens ?? 0) * price.cache_read +
+      (usage.output_tokens ?? 0) * price.output) /
+    1e6;
+  return Math.round(usd * 10000) / 10000;
+}
+
+export function createLlm({ apiKey, model, pricing = {} }) {
   const client = new Anthropic({ apiKey });
 
   async function json({ system, user, blocks = [], schema, maxTokens = 8000, model: override }) {
@@ -34,7 +46,10 @@ export function createLlm({ apiKey, model }) {
         model: useModel,
         inputTokens,
         outputTokens,
-        // Sin costo estimado: la API no lo entrega y no se inventan métricas.
+        // Costo calculado con la tarifa oficial publicada (agent-policy.yml → pricing).
+        costUsd: costOf(usage, pricing[useModel]),
+        costSource: pricing[useModel] ? 'tarifa oficial' : null,
+        cacheReadTokens: usage.cache_read_input_tokens ?? 0,
         durationMs: Date.now() - started,
         requestId: res.id,
       },

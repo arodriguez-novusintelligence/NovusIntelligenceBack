@@ -22,6 +22,7 @@ import {
 } from '../lib/requests';
 import { permissionsFor, type Permission } from '../lib/roles';
 import { createAwsServices } from '../lib/services';
+import { requestCost } from '../lib/cost';
 import { legacyWorkflow, nodesAfterDecision, renderExportHtml, sanitize, validateRules, type ExportBundle } from '../lib/workflow';
 
 export interface PreviewSession {
@@ -118,6 +119,7 @@ export function createRequestsHandler(
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
       prUrl: r.prUrl ?? null,
+      cost: requestCost(r.nodeState),
     };
   }
 

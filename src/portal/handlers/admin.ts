@@ -9,6 +9,7 @@ import { ASSIGNABLE_ROLES, isRole, permissionsFor, type Permission, type Role } 
 import { createAdminStore, type AdminStore, type AgentOverride, type FlowTemplate, type TeamMember } from '../lib/admin-store';
 import { createAdminServices, type AdminServices } from '../lib/admin-services';
 import { validateRules } from '../lib/workflow';
+import { requestCost } from '../lib/cost';
 
 type Event = APIGatewayProxyEventV2WithJWTAuthorizer;
 
@@ -299,8 +300,13 @@ export function createAdminHandler(repo: PortalRepository, store: AdminStore, re
       usage: {
         requests: all.length,
         byStatus,
-        costUsd: Math.round(all.reduce((acc, r) => acc + (r.costUsd ?? 0), 0) * 100) / 100,
-        costNote: 'Suma del costo reportado por Claude Code; los agentes por API reportan tokens, no costo.',
+        costUsd: Math.round(all.reduce((acc, r) => acc + requestCost(r.nodeState).usd, 0) * 100) / 100,
+        costNote: 'Suma de todos los agentes: Claude Code reporta su costo y los demás se calculan con la tarifa oficial de Anthropic. Ejecuciones antiguas sin costo guardado se estiman con sus tokens.',
+        byRequest: all
+          .map((r) => ({ requestId: r.requestId, title: r.title ?? r.prompt.slice(0, 80), status: r.status, ...requestCost(r.nodeState) }))
+          .filter((x) => x.usd > 0)
+          .sort((a, b) => b.usd - a.usd)
+          .slice(0, 12),
       },
     });
   }
