@@ -8,3 +8,6 @@ build/
 *.log
 .serverless/
 coverage/
+
+runner/vendor/
+runner/node_modules/

@@ -131,6 +131,8 @@ export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey,
     subtype: result?.subtype,
     text: result?.result ?? '',
     costUsd: result?.total_cost_usd ?? null,
+    inputTokens: result?.usage ? (result.usage.input_tokens ?? 0) + (result.usage.cache_read_input_tokens ?? 0) + (result.usage.cache_creation_input_tokens ?? 0) : null,
+    outputTokens: result?.usage?.output_tokens ?? null,
     turns: result?.num_turns ?? null,
     tail: res.out.split('\n').slice(-15).join('\n'),
   };

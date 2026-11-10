@@ -9,11 +9,14 @@ import {
 
 /**
  * Ciclo de vida de una solicitud (pipeline PROD con revisión):
- * queued → developing → awaiting_approval → approved → deploying → deployed
- *                     ↘ no_changes | blocked | failed      ↘ rolled_back | blocked | failed
+ * planning → planned (gate plan: «Ejecutar plan») → queued → developing → awaiting_approval → approved → deploying → deployed
+ *                                                         ↘ no_changes | blocked | failed      ↘ rolled_back | blocked | failed
  * awaiting_approval → rejected | queued (pedir ajustes: nueva iteración)
+ * deployed → rollback_requested → rollback_approved → rolling_back → rolled_back (o vuelve a deployed si falla)
  */
 export type RequestStatus =
+  | 'planning'
+  | 'planned'
   | 'queued'
   | 'developing'
   | 'awaiting_approval'
@@ -24,9 +27,85 @@ export type RequestStatus =
   | 'no_changes'
   | 'blocked'
   | 'failed'
-  | 'rolled_back';
+  | 'rolled_back'
+  | 'rollback_requested'
+  | 'rollback_approved'
+  | 'rolling_back';
 
-export type Decision = 'approve' | 'reject' | 'changes';
+export type Decision = 'approve' | 'reject' | 'changes' | 'approve_rollback' | 'reject_rollback';
+
+export type NodeStatus =
+  | 'PENDING'
+  | 'QUEUED'
+  | 'RUNNING'
+  | 'WAITING_DEPENDENCY'
+  | 'WAITING_APPROVAL'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'CANCELLED'
+  | 'BLOCKED';
+
+export interface NodeAttempt {
+  iteration: number;
+  startedAt: string;
+  endedAt?: string;
+  status: NodeStatus;
+  durationMs?: number;
+  metrics?: Record<string, unknown>;
+  output?: unknown;
+  error?: { code: string; message: string };
+  ioKey?: string;
+}
+
+export interface NodeState {
+  status: NodeStatus;
+  attempts: NodeAttempt[];
+  startedAt?: string | null;
+  endedAt?: string | null;
+  lastEvent?: string;
+  metrics?: Record<string, unknown>;
+  ioKey?: string;
+}
+
+export interface WorkflowNode {
+  id: string;
+  agentId: string | null;
+  label: string;
+  role: string;
+  kind: string;
+  layer?: string | null;
+  pattern?: string | null;
+  model?: string | null;
+  planned: 'run' | 'skip' | 'done' | 'conditional';
+  reason?: string | null;
+  definition?: Record<string, unknown> | null;
+}
+
+export interface Workflow {
+  version: number;
+  profile: string;
+  level?: string;
+  mode?: string;
+  confidence?: number;
+  rationale?: string[];
+  blocked?: boolean;
+  blockReason?: string | null;
+  nodes: WorkflowNode[];
+  edges: { id: string; source: string; target: string; label?: string | null }[];
+  framework?: Record<string, unknown>;
+  createdAt?: string;
+  legacy?: boolean;
+}
+
+export interface RulesSnapshot {
+  version: number;
+  locked: boolean;
+  lockedAt?: string;
+  lockedBy?: Actor;
+  nodes: Record<string, { mandatory: { text: string; source: string }[]; configurable: string[] }>;
+  history: { version: number; at: string; by: string; nodeId?: string; before?: string[]; after?: string[]; note?: string }[];
+}
 
 export interface Actor {
   id: string;
@@ -56,6 +135,8 @@ export interface TestResult {
 export interface Screenshot {
   key: string;
   label: string;
+  kind?: string;
+  route?: string;
 }
 
 export interface RequestRecord {
@@ -83,14 +164,35 @@ export interface RequestRecord {
   diffStat?: string;
   costUsd?: number;
   decision?: { by: Actor; at: string; decision: Decision; comment?: string };
-  deployment?: { startedAt?: string; finishedAt?: string; invalidationId?: string; smoke?: TestResult[]; screenshots?: Screenshot[] };
-  error?: { code: string; message: string };
+  deployment?: {
+    startedAt?: string;
+    finishedAt?: string;
+    invalidationId?: string;
+    smoke?: TestResult[];
+    screenshots?: Screenshot[];
+    backupKey?: string;
+    version?: string;
+    mergeCommit?: string | null;
+    [key: string]: unknown;
+  };
+  error?: { code: string; message: string } | null;
   buildId?: string;
+  workflow?: Workflow;
+  rules?: RulesSnapshot;
+  nodeState?: Record<string, NodeState>;
+  classification?: Record<string, unknown>;
+  planApproval?: { by: Actor; at: string };
+  rollback?: { requestedBy: Actor; requestedAt: string; reason: string; risks: string[]; approvedBy?: Actor; approvedAt?: string; rejectedBy?: Actor; finishedAt?: string; smoke?: TestResult[]; revertPrUrl?: string | null };
+  headSha?: string;
+  changedFiles?: string[];
 }
 
 export interface RequestEvent {
   at: string;
-  kind: 'info' | 'thought' | 'tool' | 'stage' | 'success' | 'warning' | 'error';
+  kind: 'info' | 'thought' | 'tool' | 'stage' | 'success' | 'warning' | 'error' | 'plan';
+  nodeId?: string;
+  eventType?: string;
+  status?: string;
   text: string;
   stage?: string;
   seq?: number;
@@ -108,6 +210,8 @@ export interface RequestRepository {
   /** Actualiza solo si el estado actual es uno de `from` (evita dobles aprobaciones). */
   transition(companyId: string, requestId: string, from: RequestStatus[], patch: Partial<RequestRecord>): Promise<boolean>;
   events(requestId: string, after?: string): Promise<RequestEvent[]>;
+  /** Actualiza el estado persistido de uno o más nodos (fuente de verdad del canvas). */
+  setNodes(companyId: string, requestId: string, nodes: Record<string, NodeState>): Promise<void>;
   addEvent(requestId: string, event: RequestEvent): Promise<void>;
 }
 
@@ -183,7 +287,28 @@ export function createRequestRepository(tableName: string, client?: DynamoDBDocu
           Limit: 1000,
         }),
       );
-      return ((out.Items ?? []) as (RequestEvent & { SK: string })[]).map(({ SK, ...e }) => ({ ...e, id: SK.slice(4) }));
+      return ((out.Items ?? []) as (RequestEvent & { SK: string; PK: string })[]).map(({ SK, PK: _pk, ...e }) => ({ ...e, id: SK.slice(4) }));
+    },
+    async setNodes(companyId, requestId, nodes) {
+      const entries = Object.entries(nodes);
+      if (!entries.length) return;
+      const names: Record<string, string> = { '#ns': 'nodeState' };
+      const values: Record<string, unknown> = {};
+      const sets = entries.map(([id, v], i) => {
+        names[`#n${i}`] = id;
+        values[`:n${i}`] = v;
+        return `#ns.#n${i} = :n${i}`;
+      });
+      await doc.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: requestKeys.request(companyId, requestId),
+          UpdateExpression: `SET ${sets.join(', ')}`,
+          ConditionExpression: 'attribute_exists(nodeState)',
+          ExpressionAttributeNames: names,
+          ExpressionAttributeValues: values,
+        }),
+      );
     },
     async addEvent(requestId, event) {
       const id = `${event.at}#${String(event.seq ?? 0).padStart(6, '0')}`;
@@ -195,6 +320,7 @@ export function createRequestRepository(tableName: string, client?: DynamoDBDocu
 /** Qué puede hacer cada decisión según el estado actual. */
 export function decisionAllowed(status: RequestStatus, decision: Decision): boolean {
   if (decision === 'approve') return status === 'awaiting_approval';
+  if (decision === 'approve_rollback' || decision === 'reject_rollback') return status === 'rollback_requested';
   if (decision === 'reject') return status === 'awaiting_approval' || status === 'no_changes' || status === 'blocked' || status === 'failed';
   // Pedir ajustes / reintentar: tras el informe, si no hubo cambios, si PROD cambió o si algo falló.
   return ['awaiting_approval', 'no_changes', 'blocked', 'failed', 'rolled_back'].includes(status);

@@ -7,9 +7,11 @@
     "build": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run src && node --test runner/test/",
     "portal:deploy": "serverless deploy --config serverless-portal.yml",
-    "portal:bootstrap": "node scripts/portal/bootstrap-admin.mjs"
+    "portal:bootstrap": "node scripts/portal/bootstrap-admin.mjs",
+    "portal:runner:vendor": "node scripts/portal/upload-runner.mjs --vendor-only",
+    "portal:runner:upload": "node scripts/portal/upload-runner.mjs --stage dev"
   },
   "engines": {
     "node": ">=20"

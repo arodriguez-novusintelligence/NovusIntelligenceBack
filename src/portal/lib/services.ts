@@ -67,6 +67,16 @@ export function createAwsServices(): RequestServices {
       return session;
     },
 
+    async readEvidence(key) {
+      try {
+        const out = await s3.send(new GetObjectCommand({ Bucket: env('EVIDENCE_BUCKET'), Key: key }));
+        return Buffer.from(await out.Body!.transformToByteArray());
+      } catch (error) {
+        if ((error as { name?: string }).name === 'NoSuchKey') return null;
+        throw error;
+      }
+    },
+
     async presign(key) {
       return getSignedUrl(s3, new GetObjectCommand({ Bucket: env('EVIDENCE_BUCKET'), Key: key }), { expiresIn: 900 });
     },
