@@ -185,11 +185,41 @@ export interface RequestRecord {
   classification?: Record<string, unknown>;
   planApproval?: { by: Actor; at: string };
   flowTemplate?: { id: string; name: string; version: number; agents: string[] } | null;
+  /** Archivos que complementan la solicitud (imágenes, .md, .txt, .docx). */
+  attachments?: Attachment[];
   stopped?: { by: Actor; at: string; reason?: string; previousStatus: RequestStatus };
   cancelled?: { by: Actor; at: string; reason?: string };
   rollback?: { requestedBy: Actor; requestedAt: string; reason: string; risks: string[]; approvedBy?: Actor; approvedAt?: string; rejectedBy?: Actor; finishedAt?: string; smoke?: TestResult[]; revertPrUrl?: string | null };
   headSha?: string;
   changedFiles?: string[];
+}
+
+export interface Attachment {
+  key: string;
+  name: string;
+  contentType: string;
+  size: number;
+  kind: 'image' | 'text' | 'word' | 'pdf';
+}
+
+/** Tipos permitidos como complemento de la solicitud. */
+export const ATTACHMENT_TYPES: Record<string, { kind: Attachment['kind']; ext: string[] }> = {
+  'image/png': { kind: 'image', ext: ['png'] },
+  'image/jpeg': { kind: 'image', ext: ['jpg', 'jpeg'] },
+  'image/webp': { kind: 'image', ext: ['webp'] },
+  'image/gif': { kind: 'image', ext: ['gif'] },
+  'text/markdown': { kind: 'text', ext: ['md', 'markdown'] },
+  'text/plain': { kind: 'text', ext: ['txt', 'md', 'markdown'] },
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { kind: 'word', ext: ['docx'] },
+  'application/pdf': { kind: 'pdf', ext: ['pdf'] },
+};
+export const MAX_ATTACHMENTS = 5;
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+/** Nombre seguro para la clave en S3 (sin rutas ni caracteres raros). */
+export function safeFileName(name: string): string {
+  const base = name.split(/[\\/]/).pop() ?? 'archivo';
+  return base.normalize('NFKD').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').slice(-120) || 'archivo';
 }
 
 export interface RequestEvent {

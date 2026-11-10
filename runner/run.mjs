@@ -14,6 +14,7 @@ import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-sec
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { appSession, capture } from './lib/browser.mjs';
+import { attachmentBlocks, attachmentsText, loadAttachments } from './lib/attachments.mjs';
 import { diffStrings, crawl, localFetcher, previewIndex, uiStrings, entryScripts } from './lib/bundle.mjs';
 import { runClaude } from './lib/claude.mjs';
 import { agentDefinition, buildPlan, manifest, rulesFor } from './lib/framework.mjs';
@@ -190,12 +191,16 @@ async function plan() {
       '"layers" usa: frontend, backend, database, api, cloud. "ambiguous" = true solo si sin preguntar no se puede implementar con seguridad.',
       'Escribe "resumen", "criterios_aceptacion" y "preguntas" en español, para una persona no técnica.',
     ].join('\n');
-    const user = `Solicitud del funcional:\n"""\n${req.prompt}\n"""`;
-    const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.classification });
+    const att = await loadAttachments({ s3, bucket: cfg.evidence, list: req.attachments ?? [], dir: join(cfg.work, 'adjuntos') });
+    const { blocks, skipped } = await attachmentBlocks(att.files);
+    if (att.files.length) await emit('tool', `Leyendo ${att.files.length} adjunto(s): ${att.files.map((f) => f.name).join(', ')}`);
+    if (skipped.length) await emit('warning', `Adjuntos demasiado grandes para el análisis visual: ${skipped.join(', ')}.`);
+    const user = [`Solicitud del funcional:\n"""\n${req.prompt}\n"""`, attachmentsText(att.files).replace(/ → .*$/gm, '')].filter(Boolean).join('\n\n');
+    const { data, metrics } = await llm.json({ system, user, blocks, schema: SCHEMAS.classification });
     await emit('thought', data.resumen);
     const ioKey = await saveIo('requirement-classification-agent', {
       prompt: { base: analyst.prompt, instrucciones: system.slice(analyst.prompt.length).trim(), solicitud: user, contexto: { app: cfg.app.name, repo: `${cfg.app.repo.owner}/${cfg.app.repo.name}` }, version: `${fw.branch ?? ''}@${(fw.sha ?? '').slice(0, 7)}` },
-      input: { prompt: req.prompt },
+      input: { prompt: req.prompt, adjuntos: att.files.map((f) => ({ nombre: f.name, tipo: f.kind, kb: Math.round(f.bytes / 1024) })) },
       output: data,
     });
     return { text: `Clasificado: ${data.changeTypes.join(', ') || 'sin tipo'} · riesgo ${data.riesgo}.`, output: data, metrics, ioKey, data };
@@ -302,6 +307,11 @@ async function develop() {
     return { text: `PROD coincide con main @ ${baseSha.slice(0, 7)}.`, ioKey, output: { main: baseSha, prodJs: prod.files } };
   });
 
+  // ---- Adjuntos del funcional (fuera del repo: nunca entran al PR).
+  const att = await loadAttachments({ s3, bucket: cfg.evidence, list: req.attachments ?? [], dir: join(cfg.work, 'adjuntos') });
+  const attText = attachmentsText(att.files);
+  const attBlocks = (await attachmentBlocks(att.files)).blocks;
+
   // ---- Planificador / Arquitecto (solo si el plan los incluye).
   const fileList = (await git(['ls-files', 'packages/shell/src', 'packages/shared/src'])).out.split('\n').filter(Boolean).slice(0, 1500).join('\n');
   let planOut = null;
@@ -311,8 +321,8 @@ async function develop() {
     const def = agentDefinition(id);
     const out = await step(id, `${planned(req, id).label} trabajando.`, async (emit) => {
       const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
-      const user = [`Solicitud:\n"""\n${req.prompt}\n"""`, `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}`, planOut ? `Plan:\n${JSON.stringify(planOut)}` : '', `Archivos del repo (${name}):\n${fileList}`].filter(Boolean).join('\n\n');
-      const { data, metrics } = await llm.json({ system, user, schema });
+      const user = [`Solicitud:\n"""\n${req.prompt}\n"""`, attText.replace(/ → .*$/gm, ''), `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}`, planOut ? `Plan:\n${JSON.stringify(planOut)}` : '', `Archivos del repo (${name}):\n${fileList}`].filter(Boolean).join('\n\n');
+      const { data, metrics } = await llm.json({ system, user, blocks: attBlocks, schema });
       await emit('thought', (data.pasos ?? data.decisiones ?? []).slice(0, 6).join('\n') || data['diseño'] || 'Listo.');
       const ioKey = await saveIo(id, { prompt: { base: def.prompt, instrucciones: ruleText(rulesOf(req, id)), solicitud: req.prompt, contexto: { archivos: 'listado de packages/shell/src y packages/shared/src' } }, input: { criterios: criteria }, output: data });
       return { text: 'Completado.', output: data, metrics, ioKey, data };
@@ -355,13 +365,14 @@ async function develop() {
       req.prompt,
       '"""',
       criteria.length ? `Criterios de aceptación (Analista):\n${criteria.map((c) => `- ${c}`).join('\n')}` : '',
+      attText ? `${attText}\nAbre las imágenes y documentos con la herramienta Read si los necesitas. No copies los adjuntos al repositorio.` : '',
       planOut ? `Plan del Planificador:\n${planOut.pasos.map((s) => `- ${s}`).join('\n')}` : '',
       designOut ? `Diseño del Arquitecto:\n${designOut['diseño']}` : '',
       cfg.iteration > 1
         ? [`Iteración ${cfg.iteration}: la rama ${branch} ya tiene trabajo (revisa git log/diff contra origin/${defaultBranch}).`, req.report ? `Informe anterior: ${JSON.stringify(req.report)}` : '', feedback ? `Comentarios del revisor:\n${feedback}` : 'Se pidió reintentar.'].join('\n')
         : '',
     ].filter(Boolean).join('\n\n');
-    claude = await runClaude({ cwd: repoDir, prompt, system, model: cfg.model, budgetUsd: cfg.budgetUsd, apiKey: claudeKey, emit });
+    claude = await runClaude({ cwd: repoDir, prompt, system, model: cfg.model, budgetUsd: cfg.budgetUsd, apiKey: claudeKey, emit, addDirs: att.dir ? [att.dir] : [] });
     if (!claude.ok && claude.subtype !== 'error_max_budget_usd') throw new Stop('failed', 'AGENT_FAILED', 'Claude Code no pudo terminar el desarrollo.', { tail: claude.tail });
     if (claude.subtype === 'error_max_budget_usd') await emit('warning', `Se alcanzó el presupuesto de ${cfg.budgetUsd} USD de esta ejecución.`);
     const reportPath = join(repoDir, 'nadf-report.json');

@@ -5,13 +5,13 @@ import Anthropic from '@anthropic-ai/sdk';
 export function createLlm({ apiKey, model }) {
   const client = new Anthropic({ apiKey });
 
-  async function json({ system, user, schema, maxTokens = 8000 }) {
+  async function json({ system, user, blocks = [], schema, maxTokens = 8000 }) {
     const started = Date.now();
     const res = await client.messages.create({
       model,
       max_tokens: maxTokens,
       system,
-      messages: [{ role: 'user', content: user }],
+      messages: [{ role: 'user', content: blocks.length ? [...blocks, { type: 'text', text: user }] : user }],
       output_config: { format: { type: 'json_schema', schema } },
     });
     if (res.stop_reason === 'refusal') throw Object.assign(new Error('El modelo rechazó la tarea.'), { code: 'AGENT_REFUSED' });

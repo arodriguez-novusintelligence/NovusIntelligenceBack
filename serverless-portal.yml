@@ -105,11 +105,12 @@ provider:
             - cognito-idp:AdminEnableUser
           Resource:
             Fn::GetAtt: [PortalUserPool, Arn]
-        # Logo de la empresa y catálogo de agentes.
+        # Logo de la empresa, adjuntos de solicitudes y catálogo de agentes.
         - Effect: Allow
           Action: [s3:GetObject, s3:PutObject]
           Resource:
-            Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/companies/*']]
+            - Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/companies/*']]
+            - Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/uploads/*']]
         - Effect: Allow
           Action: s3:GetObject
           Resource:
@@ -152,6 +153,7 @@ functions:
       - httpApi: { path: /api/v1/portal/apps, method: get, authorizer: { name: portalJwt } }
       - httpApi: { path: /api/v1/portal/requests, method: get, authorizer: { name: portalJwt } }
       - httpApi: { path: /api/v1/portal/requests, method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/attachments, method: post, authorizer: { name: portalJwt } }
       - httpApi: { path: '/api/v1/portal/requests/{id}', method: get, authorizer: { name: portalJwt } }
       - httpApi: { path: '/api/v1/portal/requests/{id}/decision', method: post, authorizer: { name: portalJwt } }
       - httpApi: { path: '/api/v1/portal/requests/{id}/preview-session', method: post, authorizer: { name: portalJwt } }
@@ -368,6 +370,16 @@ resources:
       Properties:
         BucketName: nadf-portal-evidence-${sls:stage}-${aws:accountId}
         VersioningConfiguration: { Status: Enabled }
+        # Subidas directas desde el portal (adjuntos y logo) con URL firmada.
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - https://portal.novusintelligencesolutions.com
+                - http://localhost:5174
+                - ${env:PORTAL_EXTRA_ORIGIN, 'http://127.0.0.1:5174'}
+              AllowedMethods: [PUT, GET]
+              AllowedHeaders: [Content-Type]
+              MaxAge: 3000
         OwnershipControls:
           Rules:
             - ObjectOwnership: BucketOwnerEnforced

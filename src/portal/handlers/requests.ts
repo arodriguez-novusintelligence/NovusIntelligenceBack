@@ -5,6 +5,11 @@ import { errorResponse, json, log } from '../lib/http';
 import { principalFromClaims, type Principal } from '../lib/principal';
 import { createDynamoRepository, type PortalRepository } from '../lib/repository';
 import {
+  ATTACHMENT_TYPES,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS,
+  safeFileName,
+  type Attachment,
   createRequestRepository,
   decisionAllowed,
   sanitizePrompt,
@@ -37,6 +42,10 @@ export interface RequestServices {
   presign(key: string): Promise<string>;
   /** Lee una evidencia del bucket (null si no existe). */
   readEvidence(key: string): Promise<Buffer | null>;
+  /** URL firmada para subir un adjunto (PUT directo a S3, tipo y tamaño fijados en la firma). */
+  presignUpload(key: string, contentType: string, size: number): Promise<string>;
+  /** Metadatos de un objeto subido (null si no existe). */
+  head(key: string): Promise<{ size: number; contentType?: string } | null>;
   /** Detiene la ejecución en curso del ejecutor (CodeBuild StopBuild). */
   stopRun(buildId: string): Promise<void>;
   /** Flujo de la empresa (plantilla vigente). */
@@ -122,6 +131,7 @@ export function createRequestsHandler(
       workflow: r.workflow ?? legacy?.workflow ?? null,
       nodeState: r.workflow ? r.nodeState ?? {} : legacy?.nodeState ?? {},
       screenshots: await sign(r.screenshots),
+      attachments: await Promise.all((r.attachments ?? []).map(async (a) => ({ ...a, url: await services.presign(a.key) }))),
       deployment: r.deployment ? { ...r.deployment, screenshots: await sign(r.deployment.screenshots) } : null,
     };
   }
@@ -166,6 +176,21 @@ export function createRequestsHandler(
     return json(200, { ok: true, requestId: ctx.requestId, apps: appsForCompany(ctx.principal.companyId).map(publicApp) });
   }
 
+  /** URL de subida para un adjunto de la solicitud (antes de crearla). */
+  async function attachmentUpload(ctx: Ctx, event: Event) {
+    if (!can(ctx, 'requests.create')) return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Tu rol no permite crear solicitudes.');
+    const input = body(event);
+    const contentType = String(input.contentType ?? '');
+    const name = String(input.name ?? 'archivo');
+    const size = Number(input.size);
+    const type = ATTACHMENT_TYPES[contentType];
+    const ext = name.toLowerCase().split('.').pop() ?? '';
+    if (!type || !type.ext.includes(ext)) return errorResponse(400, ctx.requestId, 'INVALID_TYPE', 'Puedes adjuntar imágenes (PNG, JPG, WEBP, GIF), Markdown, texto, Word (.docx) o PDF.');
+    if (!(size > 0 && size <= MAX_ATTACHMENT_BYTES)) return errorResponse(400, ctx.requestId, 'TOO_LARGE', 'Cada archivo puede pesar hasta 10 MB.');
+    const key = `uploads/${ctx.principal.companyId}/${newId()}/${safeFileName(name)}`;
+    return json(200, { ok: true, requestId: ctx.requestId, key, uploadUrl: await services.presignUpload(key, contentType, size), kind: type.kind });
+  }
+
   async function create(ctx: Ctx, event: Event) {
     if (!can(ctx, 'requests.create')) return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Tu rol no permite crear solicitudes.');
     const input = body(event);
@@ -176,6 +201,18 @@ export function createRequestsHandler(
     const app = appId ? getApp(ctx.principal.companyId, appId) : null;
     if (!app) return errorResponse(400, ctx.requestId, 'NO_APP', 'Tu empresa todavía no tiene una aplicación conectada a NADF.');
 
+    // Adjuntos: deben haberse subido a la carpeta de la empresa y coincidir en tipo y tamaño.
+    const rawAttachments = Array.isArray(input.attachments) ? input.attachments : [];
+    if (rawAttachments.length > MAX_ATTACHMENTS) return errorResponse(400, ctx.requestId, 'TOO_MANY_FILES', `Puedes adjuntar hasta ${MAX_ATTACHMENTS} archivos.`);
+    const attachments: Attachment[] = [];
+    for (const a of rawAttachments as Record<string, unknown>[]) {
+      const key = String(a?.key ?? '');
+      const type = ATTACHMENT_TYPES[String(a?.contentType ?? '')];
+      if (!key.startsWith(`uploads/${ctx.principal.companyId}/`) || !type) return errorResponse(400, ctx.requestId, 'INVALID_ATTACHMENT', 'Uno de los adjuntos no es válido.');
+      const meta = await services.head(key);
+      if (!meta || meta.size > MAX_ATTACHMENT_BYTES) return errorResponse(400, ctx.requestId, 'INVALID_ATTACHMENT', 'Uno de los adjuntos no se subió correctamente.');
+      attachments.push({ key, name: String(a.name ?? key.split('/').pop()).slice(0, 160), contentType: String(a.contentType), size: meta.size, kind: type.kind });
+    }
     let flowTemplate: RequestRecord['flowTemplate'] = null;
     if (typeof input.flowId === 'string' && input.flowId) {
       const flow = await services.getFlow(ctx.principal.companyId, input.flowId);
@@ -185,6 +222,7 @@ export function createRequestsHandler(
     const at = now().toISOString();
     const record: RequestRecord = {
       flowTemplate,
+      attachments,
       requestId: newId(),
       companyId: ctx.principal.companyId,
       appId: app.id,
@@ -198,7 +236,7 @@ export function createRequestsHandler(
       nodeState: {},
     };
     await requests.create(record);
-    await addEvent(record.requestId, `Solicitud recibida de ${who(ctx.actor)} para ${app.name}. NADF está planificando.`, 'stage', { eventType: 'REQUEST_CREATED' });
+    await addEvent(record.requestId, `Solicitud recibida de ${who(ctx.actor)} para ${app.name}${attachments.length ? ` con ${attachments.length} adjunto(s)` : ''}. NADF está planificando.`, 'stage', { eventType: 'REQUEST_CREATED' });
     const failed = await launch(ctx, record, 'plan');
     if (failed) return failed;
     log({ level: 'info', requestId: ctx.requestId, event: 'request.created', req: record.requestId, app: app.id });
@@ -532,6 +570,8 @@ export function createRequestsHandler(
           return await listApps(ctx);
         case 'POST /api/v1/portal/requests':
           return await create(ctx, event);
+        case 'POST /api/v1/portal/attachments':
+          return await attachmentUpload(ctx, event);
         case 'GET /api/v1/portal/requests':
           return await list(ctx);
         case 'GET /api/v1/portal/requests/{id}':

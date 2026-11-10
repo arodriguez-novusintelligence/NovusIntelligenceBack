@@ -73,6 +73,8 @@ function services(over: Partial<RequestServices> = {}): RequestServices {
     previewSession: vi.fn(async () => ({ token: 't', userId: 'u', platformRole: 'admin' })),
     presign: vi.fn(async (k: string) => `https://signed/${k}`),
     stopRun: vi.fn(async () => undefined),
+    presignUpload: vi.fn(async () => 'https://put'),
+    head: vi.fn(async () => ({ size: 100 })),
     getFlow: vi.fn(async (_c: string, id: string) => (id === 'flow-1' ? { flowId: 'flow-1', name: 'Con revisión', version: 2, agents: ['reviewer-agent'] } : null)),
     readEvidence: vi.fn(async (k: string) => (k.endsWith('.json') ? Buffer.from(JSON.stringify({ prompt: { base: 'x', token: 'sk-ant-abc123' } })) : Buffer.from('<html></html>'))),
     ...over,
@@ -417,5 +419,36 @@ describe('control de ejecución y flujos', () => {
     await h(ev('POST /api/v1/portal/requests/{id}/resume', { id: ID }));
     expect(repo.items.get(ID)?.status).toBe('planning');
     expect(svc.startRun).toHaveBeenLastCalledWith(expect.anything(), 'plan');
+  });
+});
+
+describe('adjuntos de la solicitud', () => {
+  it('da URL de subida solo para tipos permitidos y en la carpeta de la empresa', async () => {
+    const svc = services({ presignUpload: vi.fn(async () => 'https://put') });
+    const h = createRequestsHandler(portalRepo, memoryRequests(), svc, undefined, () => ID);
+    const ok = parse(await h(ev('POST /api/v1/portal/attachments', { body: { name: 'Requisitos del banner.docx', contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', size: 20000 } })));
+    expect(ok.key).toBe(`uploads/doevents/${ID}/Requisitos_del_banner.docx`);
+    expect(ok.kind).toBe('word');
+    expect(parse(await h(ev('POST /api/v1/portal/attachments', { body: { name: 'virus.exe', contentType: 'application/octet-stream', size: 10 } }))).code).toBe('INVALID_TYPE');
+    expect(parse(await h(ev('POST /api/v1/portal/attachments', { body: { name: 'a.png', contentType: 'text/plain', size: 10 } }))).code).toBe('INVALID_TYPE');
+    expect(parse(await h(ev('POST /api/v1/portal/attachments', { body: { name: 'a.png', contentType: 'image/png', size: 11 * 1024 * 1024 } }))).code).toBe('TOO_LARGE');
+  });
+
+  it('crea la solicitud con adjuntos verificados (tipo, carpeta y existencia)', async () => {
+    const repo = memoryRequests();
+    const h = createRequestsHandler(portalRepo, repo, services({ head: vi.fn(async () => ({ size: 1234 })) }), undefined, () => ID);
+    const res = await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el banner como en la imagen', attachments: [{ key: 'uploads/doevents/x/banner.png', name: 'banner.png', contentType: 'image/png' }] } }));
+    expect(status(res)).toBe(201);
+    expect(repo.items.get(ID)?.attachments).toEqual([{ key: 'uploads/doevents/x/banner.png', name: 'banner.png', contentType: 'image/png', size: 1234, kind: 'image' }]);
+  });
+
+  it('rechaza adjuntos de otra empresa, no subidos o demasiados', async () => {
+    const h = createRequestsHandler(portalRepo, memoryRequests(), services({ head: vi.fn(async () => null) }), undefined, () => ID);
+    const other = await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el banner del inicio', attachments: [{ key: 'uploads/novus/x/a.png', contentType: 'image/png' }] } }));
+    expect(parse(other).code).toBe('INVALID_ATTACHMENT');
+    const missing = await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el banner del inicio', attachments: [{ key: 'uploads/doevents/x/a.png', contentType: 'image/png' }] } }));
+    expect(parse(missing).code).toBe('INVALID_ATTACHMENT');
+    const many = Array.from({ length: 6 }, (_, i) => ({ key: `uploads/doevents/${i}/a.png`, contentType: 'image/png' }));
+    expect(parse(await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el banner del inicio', attachments: many } }))).code).toBe('TOO_MANY_FILES');
   });
 });

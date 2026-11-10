@@ -56,7 +56,7 @@ function describeTool(name, input = {}) {
   }
 }
 
-export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey, emit, timeoutMs = 50 * 60 * 1000 }) {
+export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey, emit, addDirs = [], timeoutMs = 50 * 60 * 1000 }) {
   let result = null;
   let lastPlan = '';
   const pending = [];
@@ -74,6 +74,7 @@ export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey,
     String(budgetUsd),
     '--append-system-prompt',
     system,
+    ...addDirs.flatMap((d) => ['--add-dir', d]),
     '--allowedTools',
     ...ALLOWED_TOOLS,
     '--disallowedTools',

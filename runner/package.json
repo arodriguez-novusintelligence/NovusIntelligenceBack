@@ -16,6 +16,7 @@
     "@aws-sdk/lib-dynamodb": "^3.758.0",
     "playwright": "1.49.1",
     "@anthropic-ai/sdk": "^1.8.0",
-    "yaml": "^2.6.1"
+    "yaml": "^2.6.1",
+    "mammoth": "^1.8.0"
   }
 }

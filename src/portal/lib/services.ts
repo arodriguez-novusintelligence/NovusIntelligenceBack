@@ -1,7 +1,7 @@
 import { CodeBuildClient, StartBuildCommand, StopBuildCommand } from '@aws-sdk/client-codebuild';
 import { createAdminStore } from './admin-store';
 import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { RequestServices, PreviewSession } from '../handlers/requests';
@@ -66,6 +66,19 @@ export function createAwsServices(): RequestServices {
       // El JWT de la app dura 30 días; se renueva cada 6 horas.
       sessions.set(app.id, { session, exp: Date.now() + 6 * 3600 * 1000 });
       return session;
+    },
+
+    async presignUpload(key, contentType, size) {
+      return getSignedUrl(s3, new PutObjectCommand({ Bucket: env('EVIDENCE_BUCKET'), Key: key, ContentType: contentType, ContentLength: size }), { expiresIn: 600 });
+    },
+
+    async head(key) {
+      try {
+        const out = await s3.send(new HeadObjectCommand({ Bucket: env('EVIDENCE_BUCKET'), Key: key }));
+        return { size: out.ContentLength ?? 0, contentType: out.ContentType };
+      } catch {
+        return null;
+      }
     },
 
     async stopRun(buildId) {
