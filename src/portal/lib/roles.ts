@@ -11,6 +11,7 @@ export const ROLES = [
   'aprobador',
   'funcional',
   'desarrollador',
+  'arquitecto',
   'observador',
 ] as const;
 
@@ -23,6 +24,8 @@ export const PERMISSIONS = [
   'apps.manage',
   'connectors.manage',
   'agents.manage',
+  'agents.define',
+  'workflows.manage',
   'requests.create',
   'requests.submit',
   'reports.view',
@@ -52,7 +55,10 @@ const ROLE_PERMISSIONS: Record<Role, readonly Permission[]> = {
     'reports.view',
     'deployments.view',
     'deployments.operate',
+    'workflows.manage',
   ],
+  // Arquitecto: ajusta definiciones de agentes y flujos SOLO para su empresa (nunca el NADF global).
+  arquitecto: ['agents.manage', 'agents.define', 'workflows.manage', 'connectors.manage', 'reports.view', 'deployments.view', 'audit.view'],
   observador: ['reports.view', 'deployments.view'],
 };
 
@@ -76,3 +82,6 @@ export function permissionsFor(roles: readonly Role[]): Permission[] {
 export function requiresMfa(roles: readonly Role[]): boolean {
   return roles.some((role) => MFA_REQUIRED_ROLES.includes(role));
 }
+
+/** Roles que el Admin de una empresa puede asignar (novus-admin solo lo otorga Novus). */
+export const ASSIGNABLE_ROLES: readonly Role[] = ['admin', 'aprobador', 'funcional', 'desarrollador', 'arquitecto', 'observador'];

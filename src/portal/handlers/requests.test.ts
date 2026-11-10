@@ -72,6 +72,8 @@ function services(over: Partial<RequestServices> = {}): RequestServices {
     mfaEnabled: vi.fn(async () => true),
     previewSession: vi.fn(async () => ({ token: 't', userId: 'u', platformRole: 'admin' })),
     presign: vi.fn(async (k: string) => `https://signed/${k}`),
+    stopRun: vi.fn(async () => undefined),
+    getFlow: vi.fn(async (_c: string, id: string) => (id === 'flow-1' ? { flowId: 'flow-1', name: 'Con revisión', version: 2, agents: ['reviewer-agent'] } : null)),
     readEvidence: vi.fn(async (k: string) => (k.endsWith('.json') ? Buffer.from(JSON.stringify({ prompt: { base: 'x', token: 'sk-ant-abc123' } })) : Buffer.from('<html></html>'))),
     ...over,
   };
@@ -356,5 +358,64 @@ describe('solicitudes', () => {
     const res = parse(await h(ev('GET /api/v1/portal/requests/{id}', { id: ID })));
     expect(res.request.workflow.legacy).toBe(true);
     expect(res.request.workflow.version).toBe(0);
+  });
+});
+
+describe('control de ejecución y flujos', () => {
+  it('crear con un flujo de la empresa guarda una copia de la plantilla', async () => {
+    const repo = memoryRequests();
+    const h = createRequestsHandler(portalRepo, repo, services(), undefined, () => ID);
+    await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el color del banner', flowId: 'flow-1' } }));
+    expect(repo.items.get(ID)?.flowTemplate).toEqual({ id: 'flow-1', name: 'Con revisión', version: 2, agents: ['reviewer-agent'] });
+    const bad = await h(ev('POST /api/v1/portal/requests', { body: { prompt: 'Cambiar el color del banner', flowId: 'no-existe' } }));
+    expect(parse(bad).code).toBe('INVALID_FLOW');
+  });
+
+  it('detener corta la ejecución, cancela nodos en curso y permite reanudar', async () => {
+    const repo = seeded('developing', { buildId: 'b-1', nodeState: { 'frontend-integration-agent': { status: 'RUNNING', attempts: [{ iteration: 1, startedAt: 'x', status: 'RUNNING' }] }, 'human-approval': { status: 'PENDING', attempts: [] } } });
+    const svc = services();
+    const h = createRequestsHandler(portalRepo, repo, svc);
+    const res = await h(ev('POST /api/v1/portal/requests/{id}/stop', { id: ID, groups: '[funcional]', sub: 'f1' }));
+    expect(parse(res).status).toBe('stopped');
+    expect(svc.stopRun).toHaveBeenCalledWith('b-1');
+    expect(repo.items.get(ID)?.nodeState?.['frontend-integration-agent'].status).toBe('CANCELLED');
+    expect(repo.items.get(ID)?.nodeState?.['frontend-integration-agent'].attempts[0].status).toBe('CANCELLED');
+    const again = await h(ev('POST /api/v1/portal/requests/{id}/resume', { id: ID, groups: '[funcional]', sub: 'f1' }));
+    expect(parse(again).status).toBe('queued');
+    expect(repo.items.get(ID)?.iteration).toBe(2);
+    expect(svc.startRun).toHaveBeenLastCalledWith(expect.anything(), 'develop');
+  });
+
+  it('no se puede detener ni cancelar un despliegue en curso', async () => {
+    const h = createRequestsHandler(portalRepo, seeded('deploying'), services());
+    expect(parse(await h(ev('POST /api/v1/portal/requests/{id}/stop', { id: ID }))).code).toBe('INVALID_STATE');
+    expect(parse(await h(ev('POST /api/v1/portal/requests/{id}/cancel', { id: ID }))).code).toBe('INVALID_STATE');
+  });
+
+  it('cancelar cierra la solicitud y los nodos pendientes', async () => {
+    const repo = seeded('awaiting_approval', { prNumber: 12 });
+    const h = createRequestsHandler(portalRepo, repo, services());
+    await h(ev('POST /api/v1/portal/requests/{id}/cancel', { id: ID, body: { reason: 'Ya no se necesita' } }));
+    const r = repo.items.get(ID)!;
+    expect(r.status).toBe('cancelled');
+    expect(r.nodeState?.['human-approval'].status).toBe('CANCELLED');
+    expect(r.nodeState?.result.status).toBe('CANCELLED');
+    expect(repo.log.at(-1)?.text).toContain('PR #12');
+  });
+
+  it('un observador no puede detener ni cancelar', async () => {
+    const h = createRequestsHandler(portalRepo, seeded('developing'), services());
+    expect(status(await h(ev('POST /api/v1/portal/requests/{id}/stop', { id: ID, groups: '[observador]' })))).toBe(403);
+    expect(status(await h(ev('POST /api/v1/portal/requests/{id}/cancel', { id: ID, groups: '[observador]' })))).toBe(403);
+  });
+
+  it('detenido mientras planificaba: reanudar vuelve a planificar', async () => {
+    const repo = seeded('planning', { workflow: undefined });
+    const svc = services();
+    const h = createRequestsHandler(portalRepo, repo, svc);
+    await h(ev('POST /api/v1/portal/requests/{id}/stop', { id: ID }));
+    await h(ev('POST /api/v1/portal/requests/{id}/resume', { id: ID }));
+    expect(repo.items.get(ID)?.status).toBe('planning');
+    expect(svc.startRun).toHaveBeenLastCalledWith(expect.anything(), 'plan');
   });
 });

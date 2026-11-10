@@ -85,7 +85,35 @@ provider:
             Fn::GetAtt: [PortalUserPool, Arn]
         - Effect: Allow
           Action: secretsmanager:GetSecretValue
-          Resource: arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/*/web-app-user-*
+          Resource:
+            - arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/*/web-app-user-*
+            - arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/platform/github-app-*
+        - Effect: Allow
+          Action: secretsmanager:DescribeSecret
+          Resource: arn:aws:secretsmanager:${aws:region}:${aws:accountId}:secret:/nadf/platform/claude-api-key-*
+        # Detener/cancelar ejecuciones del ejecutor.
+        - Effect: Allow
+          Action: codebuild:StopBuild
+          Resource: arn:aws:codebuild:${aws:region}:${aws:accountId}:project/nadf-runner-${sls:stage}
+        # Equipo: el Admin de cada empresa gestiona SOLO usuarios de su empresa (validado en el código).
+        - Effect: Allow
+          Action:
+            - cognito-idp:AdminCreateUser
+            - cognito-idp:AdminAddUserToGroup
+            - cognito-idp:AdminRemoveUserFromGroup
+            - cognito-idp:AdminDisableUser
+            - cognito-idp:AdminEnableUser
+          Resource:
+            Fn::GetAtt: [PortalUserPool, Arn]
+        # Logo de la empresa y catálogo de agentes.
+        - Effect: Allow
+          Action: [s3:GetObject, s3:PutObject]
+          Resource:
+            Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/companies/*']]
+        - Effect: Allow
+          Action: s3:GetObject
+          Resource:
+            Fn::Join: ['', [{ 'Fn::GetAtt': [EvidenceBucket, Arn] }, '/runner/catalog.json']]
 
 plugins:
   - serverless-esbuild
@@ -132,6 +160,32 @@ functions:
       - httpApi: { path: '/api/v1/portal/requests/{id}/rollback', method: post, authorizer: { name: portalJwt } }
       - httpApi: { path: '/api/v1/portal/requests/{id}/nodes/{nodeId}', method: get, authorizer: { name: portalJwt } }
       - httpApi: { path: '/api/v1/portal/requests/{id}/export', method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/requests/{id}/stop', method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/requests/{id}/resume', method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/requests/{id}/cancel', method: post, authorizer: { name: portalJwt } }
+
+  portalAdmin:
+    name: nadf-portal-admin-${sls:stage}
+    handler: src/portal/handlers/admin.handler
+    description: NADF — equipo, empresa, agentes (ajustes por empresa), flujos, conectores y gobierno
+    memorySize: 512
+    timeout: 20
+    events:
+      - httpApi: { path: /api/v1/portal/team, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/team, method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/team/{userId}', method: patch, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/team/{userId}/reinvite', method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/company, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/company, method: put, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/company/logo, method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/agents, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/agents/{agentId}', method: put, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/flows, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/flows, method: post, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/flows/{flowId}', method: put, authorizer: { name: portalJwt } }
+      - httpApi: { path: '/api/v1/portal/flows/{flowId}', method: delete, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/connectors, method: get, authorizer: { name: portalJwt } }
+      - httpApi: { path: /api/v1/portal/governance, method: get, authorizer: { name: portalJwt } }
 
 resources:
   Resources:
@@ -248,6 +302,13 @@ resources:
         GroupName: funcional
         Description: Pide ajustes al agente y solicita el paso a producción
         Precedence: 40
+    GroupArquitecto:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: arquitecto
+        Description: Ajusta definiciones de agentes y flujos solo para su empresa
+        Precedence: 35
     GroupObservador:
       Type: AWS::Cognito::UserPoolGroup
       Properties:

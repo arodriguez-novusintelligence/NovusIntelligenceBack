@@ -11,6 +11,8 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { appSession, capture } from './lib/browser.mjs';
 import { diffStrings, crawl, localFetcher, previewIndex, uiStrings, entryScripts } from './lib/bundle.mjs';
 import { runClaude } from './lib/claude.mjs';
@@ -121,6 +123,22 @@ async function prodStrings(clients) {
   return { index, strings: uiStrings(files), files: files.size };
 }
 
+/** Ajustes de agentes de la empresa (AGENTDEF#<agente>, versión vigente). Nunca modifican el NADF global. */
+async function companyAgents() {
+  const doc = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+  const out = await doc.send(new QueryCommand({ TableName: cfg.table, KeyConditionExpression: 'PK = :pk AND begins_with(SK, :sk)', ExpressionAttributeValues: { ':pk': `COMPANY#${cfg.companyId}`, ':sk': 'AGENTDEF#' } }));
+  const map = {};
+  for (const item of out.Items ?? []) map[item.agentId] = { version: item.version, instructions: item.instructions ?? '', mandatory: item.mandatory ?? [], configurable: item.configurable ?? [], updatedBy: item.updatedBy, updatedAt: item.updatedAt };
+  return map;
+}
+
+/** Prompt efectivo: definición del framework + instrucciones de la empresa congeladas en la ejecución. */
+function promptOf(req, id) {
+  const base = agentDefinition(id)?.prompt ?? '';
+  const company = req.agentOverrides?.[id];
+  return company?.instructions ? `${base}\n\n## Instrucciones de la empresa (v${company.version})\n${company.instructions}` : base;
+}
+
 const planned = (req, id) => req.workflow?.nodes?.find((n) => n.id === id);
 const willRun = (req, id) => planned(req, id)?.planned === 'run' || planned(req, id)?.planned === 'conditional';
 const rulesOf = (req, id) => req.rules?.nodes?.[id] ?? { mandatory: [], configurable: [] };
@@ -159,7 +177,8 @@ async function plan() {
   await state.nodeStart('request', 'Solicitud registrada.');
   await state.nodeEnd('request', NODE.COMPLETED, `Pedido de ${req.createdBy?.name ?? req.createdBy?.email}.`, { output: { prompt: req.prompt } });
 
-  const analyst = agentDefinition('requirement-classification-agent');
+  const overrides = await companyAgents();
+  const analyst = { ...agentDefinition('requirement-classification-agent'), prompt: promptOf({ agentOverrides: overrides }, 'requirement-classification-agent') };
   const classification = await step('requirement-classification-agent', 'El Analista está clasificando tu solicitud.', async (emit) => {
     const ctx = `Aplicación: ${cfg.app.name} (${cfg.app.repo.owner}/${cfg.app.repo.name}), React + Vite, solo frontend conectado. URL: ${cfg.app.prod.url}.`;
     const system = [
@@ -192,8 +211,8 @@ async function plan() {
   });
 
   const result = await step('orchestrator', 'El Orquestador arma el plan con los presets del proyecto.', async () => {
-    const p = buildPlan(decision.d, { projectId: cfg.companyId, appLayers: ['frontend'], model: cfg.model });
-    const rules = rulesFor(p, cfg.companyId);
+    const p = buildPlan(decision.d, { projectId: cfg.companyId, appLayers: ['frontend'], model: cfg.model, flow: req.flowTemplate ?? null });
+    const rules = rulesFor(p, cfg.companyId, overrides);
     const ioKey = await saveIo('orchestrator', { prompt: null, input: { decision: decision.d, project: cfg.companyId }, output: { nodes: p.nodes.map((n) => ({ id: n.id, planned: n.planned, reason: n.reason })), edges: p.edges } });
     return { text: `Plan listo: ${p.nodes.filter((n) => n.planned === 'run').length} pasos a ejecutar, ${p.nodes.filter((n) => n.planned === 'skip').length} omitidos.`, ioKey, p, rules };
   });
@@ -210,10 +229,11 @@ async function plan() {
     stage: p.blocked ? 'blocked' : 'planned',
     workflow,
     rules,
+    agentOverrides: overrides,
     classification: signals,
     title: req.title ?? signals.resumen?.slice(0, 90),
     error: p.blocked ? { code: 'PLAN_BLOCKED', message: `${p.blockReason}${signals.preguntas?.length ? ` Preguntas: ${signals.preguntas.join(' ')}` : ''}` } : null,
-  });
+  }, ['planning']);
   await state.emit(p.blocked ? 'warning' : 'success', p.blocked ? p.blockReason : 'Plan listo. Revisa los agentes y sus reglas; cuando quieras, pulsa «Ejecutar plan».', { eventType: p.blocked ? 'PLAN_BLOCKED' : 'PLAN_READY' });
 }
 
@@ -290,7 +310,7 @@ async function develop() {
     if (!willRun(req, id)) continue;
     const def = agentDefinition(id);
     const out = await step(id, `${planned(req, id).label} trabajando.`, async (emit) => {
-      const system = `${def.prompt}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
+      const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
       const user = [`Solicitud:\n"""\n${req.prompt}\n"""`, `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}`, planOut ? `Plan:\n${JSON.stringify(planOut)}` : '', `Archivos del repo (${name}):\n${fileList}`].filter(Boolean).join('\n\n');
       const { data, metrics } = await llm.json({ system, user, schema });
       await emit('thought', (data.pasos ?? data.decisiones ?? []).slice(0, 6).join('\n') || data['diseño'] || 'Listo.');
@@ -327,7 +347,7 @@ async function develop() {
       `- AL TERMINAR escribe nadf-report.json en la raíz del repo con este formato (JSON válido, en español): ${JSON.stringify(reportSchema)}`,
       '- En "rutas_a_revisar" pon hasta 4 rutas (path) donde el aprobador ve el cambio; la vista previa abre logueada con un usuario admin.',
     ].join('\n');
-    const system = `${dev.prompt}\n\n${instructions}`;
+    const system = `${promptOf(req, 'frontend-integration-agent')}\n\n${instructions}`;
     const feedback = (req.feedback ?? []).map((f) => `- ${f.by?.name ?? f.by?.email ?? 'Revisor'}: ${f.text}`).join('\n');
     const prompt = [
       `Solicitud de ${req.createdBy?.name ?? req.createdBy?.email} para ${cfg.app.name}:`,
@@ -363,7 +383,7 @@ async function develop() {
     await writeFile(join(repoDir, '.env.prod'), envProd);
     files = changed.filter((p) => !reverted.includes(p) && p !== '.env.prod' && p !== 'nadf-report.json');
     const ioKey = await saveIo('frontend-integration-agent', {
-      prompt: { base: dev.prompt, instrucciones: instructions, solicitud: prompt, contexto: { repo: `${owner}/${name}`, rama: branch, base: baseSha }, version: `${fw.branch ?? ''}@${(fw.sha ?? '').slice(0, 7)}` },
+      prompt: { base: promptOf(req, 'frontend-integration-agent'), instrucciones: instructions, solicitud: prompt, contexto: { repo: `${owner}/${name}`, rama: branch, base: baseSha }, version: `${fw.branch ?? ''}@${(fw.sha ?? '').slice(0, 7)}` },
       input: { criterios: criteria, plan: planOut, diseño: designOut },
       output: report,
       artefactos: { archivos: files, revertidos: reverted },
@@ -375,7 +395,7 @@ async function develop() {
   const ahead = remoteBranch ? (await git(['rev-list', '--count', `origin/${defaultBranch}..HEAD`])).out.trim() : '0';
   if (!files.length && ahead === '0') {
     await skipRest(req, ['preview', 'qa-agent', 'security-gate', 'security-agent', 'reviewer-agent', 'pull-request', 'human-approval', 'release', 'prod-verification'], 'No se ejecuta: el agente no hizo cambios.');
-    await state.update({ status: 'no_changes', stage: 'done', title: report.titulo ?? req.title, report, tests, costUsd: (req.costUsd ?? 0) + (claude?.costUsd ?? 0) });
+    await state.update({ status: 'no_changes', stage: 'done', title: report.titulo ?? req.title, report, tests, costUsd: (req.costUsd ?? 0) + (claude?.costUsd ?? 0) }, ['developing']);
     await state.emit('warning', 'El agente no hizo cambios en el código. Revisa su informe y sus preguntas.');
     return;
   }
@@ -444,7 +464,7 @@ async function develop() {
     const def = agentDefinition(id);
     branches.push(
       step(id, 'El agente de Seguridad revisa el diff.', async (emit) => {
-        const system = `${def.prompt}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
+        const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
         const user = `Solicitud:\n${req.prompt}\n\nDiff:\n${diff.slice(0, 90_000)}`;
         const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review });
         await emit('thought', data.resumen);
@@ -464,7 +484,7 @@ async function develop() {
   if (willRun(req, 'reviewer-agent')) {
     const def = agentDefinition('reviewer-agent');
     await step('reviewer-agent', 'El Revisor compara el cambio con los criterios de aceptación.', async (emit) => {
-      const system = `${def.prompt}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'reviewer-agent'))}\nResponde solo con el JSON pedido, en español.`;
+      const system = `${promptOf(req, 'reviewer-agent')}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'reviewer-agent'))}\nResponde solo con el JSON pedido, en español.`;
       const user = `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}\n\nDiff:\n${diff.slice(0, 90_000)}`;
       const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review });
       await emit('thought', data.resumen);
@@ -530,7 +550,7 @@ async function develop() {
     diffStat,
     changedFiles: files,
     costUsd: Math.round(((req.costUsd ?? 0) + (claude?.costUsd ?? 0)) * 100) / 100,
-  });
+  }, ['developing']);
   await state.nodeSet('human-approval', NODE.WAITING_APPROVAL, `Listo para revisión. PR #${pr.number}. Abre la vista previa y decide.`);
 }
 
@@ -741,7 +761,8 @@ try {
   if (stop.extra?.tail || error.tail) await state.emit('info', `Detalle técnico:\n${String(stop.extra?.tail ?? error.tail).slice(-1500)}`);
   // Un rollback fallido deja la solicitud desplegada (PROD no se tocó o se restauró parcialmente: se informa).
   const finalStatus = cfg.phase === 'rollback' ? 'deployed' : stop.status;
-  const ok = await state.update({ status: finalStatus, stage: finalStatus, error: { code: stop.code, message: stop.message }, tests: tests.length ? tests : undefined });
+  const phaseStatus = { plan: ['planning'], develop: ['developing', 'queued'], deploy: ['deploying', 'approved'], rollback: ['rolling_back', 'rollback_approved'] }[cfg.phase];
+  const ok = await state.update({ status: finalStatus, stage: finalStatus, error: { code: stop.code, message: stop.message }, tests: tests.length ? tests : undefined }, phaseStatus);
   if (!ok) console.error('No se pudo actualizar el estado final');
   process.exitCode = 1;
 }

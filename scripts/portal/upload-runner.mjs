@@ -5,7 +5,8 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const arg = (name, fallback) => (process.argv.includes(name) ? process.argv[process.argv.indexOf(name) + 1] : fallback);
 const stage = arg('--stage', 'dev');
@@ -54,6 +55,18 @@ try {
     repo: 'NovusAIDevelopmentFramework', sha, branch, dirty, packagedAt: new Date().toISOString(),
     agents: readdirSync(join(vendor, 'framework/.claude/agents')).length,
   }, null, 2));
+
+  // 3) Catálogo de agentes para el portal (definición real + explicación) → runner/catalog.json.
+  const catalogFile = join(dir, 'catalog.json');
+  // El catálogo se genera con el runner local (tiene node_modules) sobre el vendor recién armado.
+  if (!vendorOnly) {
+    rmSync(resolve('runner/vendor'), { recursive: true, force: true });
+    cpSync(vendor, resolve('runner/vendor'), { recursive: true });
+  }
+  const { buildCatalog } = await import(pathToFileURL(resolve('runner/lib/catalog.mjs')).href);
+  writeFileSync(catalogFile, JSON.stringify(buildCatalog()));
+  writeFileSync(resolve('runner/vendor/catalog.json'), JSON.stringify(buildCatalog(), null, 2));
+  if (!vendorOnly) sh('aws', ['s3', 'cp', catalogFile, `s3://${bucket}/runner/catalog.json`, '--region', region, '--quiet', '--content-type', 'application/json']);
 
   if (vendorOnly) {
     console.log(`vendor listo en runner/vendor (framework ${branch}@${sha.slice(0, 7)})`);

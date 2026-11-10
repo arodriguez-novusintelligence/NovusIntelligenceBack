@@ -30,7 +30,9 @@ export type RequestStatus =
   | 'rolled_back'
   | 'rollback_requested'
   | 'rollback_approved'
-  | 'rolling_back';
+  | 'rolling_back'
+  | 'stopped'
+  | 'cancelled';
 
 export type Decision = 'approve' | 'reject' | 'changes' | 'approve_rollback' | 'reject_rollback';
 
@@ -182,6 +184,9 @@ export interface RequestRecord {
   nodeState?: Record<string, NodeState>;
   classification?: Record<string, unknown>;
   planApproval?: { by: Actor; at: string };
+  flowTemplate?: { id: string; name: string; version: number; agents: string[] } | null;
+  stopped?: { by: Actor; at: string; reason?: string; previousStatus: RequestStatus };
+  cancelled?: { by: Actor; at: string; reason?: string };
   rollback?: { requestedBy: Actor; requestedAt: string; reason: string; risks: string[]; approvedBy?: Actor; approvedAt?: string; rejectedBy?: Actor; finishedAt?: string; smoke?: TestResult[]; revertPrUrl?: string | null };
   headSha?: string;
   changedFiles?: string[];

@@ -69,3 +69,30 @@ test('validación de reglas configurables', () => {
   assert.match(validateRules(Array(21).fill('x')), /Máximo/);
   assert.match(validateRules(['']), /vacía/);
 });
+
+test('flujo de la empresa: decide los agentes opcionales y conserva base y controles', () => {
+  const d = decideComplexity({ description: 'Cambiar color', changeTypes: ['color'] });
+  const p = buildPlan(d, { projectId: 'doevents', appLayers: ['frontend'], model: 'm', flow: { id: 'f1', name: 'Con revisión', version: 3, agents: ['reviewer-agent', 'backend-agent'] } });
+  assert.equal(node(p, 'reviewer-agent').planned, 'run');
+  assert.match(node(p, 'reviewer-agent').reason, /Con revisión/);
+  assert.equal(node(p, 'architect-agent').planned, 'skip');
+  assert.match(node(p, 'architect-agent').reason, /no lo incluye/);
+  for (const id of ['request', 'requirement-classification-agent', 'qa-agent', 'result', 'prod-preflight', 'security-gate', 'human-approval']) assert.ok(node(p, id), id);
+  assert.equal(node(p, 'backend-agent'), undefined);
+  assert.deepEqual(p.flow, { id: 'f1', name: 'Con revisión', version: 3 });
+});
+
+test('un flujo nunca salta un bloqueo del enrutador', () => {
+  const p = buildPlan(decideComplexity({ description: 'x', ambiguous: true }), { projectId: 'doevents', flow: { id: 'f', name: 'F', agents: ['reviewer-agent'] } });
+  assert.equal(p.blocked, true);
+  assert.equal(node(p, 'reviewer-agent').planned, 'skip');
+});
+
+test('reglas de la empresa se suman a las obligatorias y reemplazan las configurables', () => {
+  const p = plan({ description: 'Cambiar color', changeTypes: ['color'] });
+  const r = rulesFor(p, 'doevents', { 'frontend-integration-agent': { version: 2, mandatory: ['Usar solo colores del manual de marca'], configurable: ['Preferir tokens de color existentes'] } });
+  const dev = r['frontend-integration-agent'];
+  assert.ok(dev.mandatory.some((m) => m.text === 'Usar solo colores del manual de marca' && m.source === 'Empresa · v2'));
+  assert.ok(dev.mandatory.some((m) => m.source === 'Plataforma NADF'));
+  assert.deepEqual(dev.configurable, ['Preferir tokens de color existentes']);
+});

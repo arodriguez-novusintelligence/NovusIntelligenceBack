@@ -1,4 +1,5 @@
-import { CodeBuildClient, StartBuildCommand } from '@aws-sdk/client-codebuild';
+import { CodeBuildClient, StartBuildCommand, StopBuildCommand } from '@aws-sdk/client-codebuild';
+import { createAdminStore } from './admin-store';
 import { AdminGetUserCommand, CognitoIdentityProviderClient } from '@aws-sdk/client-cognito-identity-provider';
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
@@ -65,6 +66,14 @@ export function createAwsServices(): RequestServices {
       // El JWT de la app dura 30 días; se renueva cada 6 horas.
       sessions.set(app.id, { session, exp: Date.now() + 6 * 3600 * 1000 });
       return session;
+    },
+
+    async stopRun(buildId) {
+      await codebuild.send(new StopBuildCommand({ id: buildId }));
+    },
+
+    async getFlow(companyId, flowId) {
+      return createAdminStore(env('PORTAL_TABLE')).getFlow(companyId, flowId);
     },
 
     async readEvidence(key) {

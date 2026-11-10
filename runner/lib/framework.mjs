@@ -132,11 +132,16 @@ const LLM_AGENTS = new Set(['requirement-classification-agent', 'planner-agent',
  * @param decision RoutingDecision de decideComplexity
  * @param opts { projectId, appLayers: ['frontend'], model }
  */
-export function buildPlan(decision, { projectId, appLayers = ['frontend'], model }) {
+export function buildPlan(decision, { projectId, appLayers = ['frontend'], model, flow = null }) {
   const presets = projectSelection(projectId);
-  const enabledShort = presets[decision.profile]?.enabled ?? [];
-  const enabled = new Set(enabledShort.map((s) => SHORT_TO_AGENT[s]).filter(Boolean));
-  const fullSet = new Set((presets.FULL?.enabled ?? []).map((s) => SHORT_TO_AGENT[s]).filter(Boolean));
+  // Flujo personalizado de la empresa: decide los agentes opcionales; los pasos base y los controles de la plataforma se mantienen.
+  const enabledShort = flow ? [] : presets[decision.profile]?.enabled ?? [];
+  const enabled = flow
+    ? new Set(['frontend-integration-agent', 'qa-agent', ...(flow.agents ?? []).filter((a) => ['planner-agent', 'architect-agent', 'security-agent', 'reviewer-agent'].includes(a))])
+    : new Set(enabledShort.map((s) => SHORT_TO_AGENT[s]).filter(Boolean));
+  const fullSet = flow
+    ? new Set(['planner-agent', 'architect-agent', 'security-agent', 'reviewer-agent'])
+    : new Set((presets.FULL?.enabled ?? []).map((s) => SHORT_TO_AGENT[s]).filter(Boolean));
   const catalog = profileCatalog();
   const profileInfo = catalog[decision.profile] ?? {};
   const blocked = decision.profile === 'BLOCKED';
@@ -166,7 +171,8 @@ export function buildPlan(decision, { projectId, appLayers = ['frontend'], model
   const link = (from, to, label) => edges.push({ id: `${from}->${to}`, source: from, target: to, label: label ?? null });
   const choose = (agentId, why) => {
     if (blocked || unsupported) return { planned: 'skip', reason: blocked ? 'El perfil BLOCKED no ejecuta agentes.' : 'La app conectada no incluye backend.' };
-    if (enabled.has(agentId)) return { planned: 'run', reason: why ?? `Incluido en el perfil ${decision.profile} (preset del proyecto).` };
+    if (enabled.has(agentId)) return { planned: 'run', reason: why ?? (flow ? `Incluido por el flujo «${flow.name}».` : `Incluido en el perfil ${decision.profile} (preset del proyecto).`) };
+    if (flow) return { planned: 'skip', reason: `Omitido: el flujo «${flow.name}» no lo incluye.` };
     const excluded = profileInfo.excluded_domains?.length ? ` (excluye ${profileInfo.excluded_domains.join(', ')})` : '';
     return { planned: 'skip', reason: `Omitido: el perfil ${decision.profile}${excluded} no lo requiere.` };
   };
@@ -174,7 +180,7 @@ export function buildPlan(decision, { projectId, appLayers = ['frontend'], model
   add('request', { planned: 'done' });
   add('requirement-classification-agent', { planned: 'done', reason: 'Clasifica el pedido y entrega las señales al router.' });
   add('complexity-router', { planned: 'done', reason: `Perfil ${decision.profile} · confianza ${decision.confidence}` });
-  add('orchestrator', { planned: 'done', reason: `Preset ${projectId}: ${enabledShort.join(', ') || 'ninguno'}` });
+  add('orchestrator', { planned: 'done', reason: flow ? `Flujo de la empresa «${flow.name}» (v${flow.version ?? 1})` : `Preset ${projectId}: ${enabledShort.join(', ') || 'ninguno'}` });
   link('request', 'requirement-classification-agent');
   link('requirement-classification-agent', 'complexity-router');
   link('complexity-router', 'orchestrator');
@@ -243,6 +249,7 @@ export function buildPlan(decision, { projectId, appLayers = ['frontend'], model
     selectedAgents: decision.selectedAgents,
     excludedDomains: decision.excludedDomains,
     escalationOn: decision.escalationOn,
+    flow: flow ? { id: flow.id, name: flow.name, version: flow.version ?? 1 } : null,
     blocked: gated,
     blockReason: blocked ? 'El enrutador marcó la solicitud como BLOCKED (información insuficiente o riesgo no evaluable).' : unsupported ? 'El cambio requiere backend y la app conectada es solo frontend.' : null,
     nodes,
@@ -251,7 +258,7 @@ export function buildPlan(decision, { projectId, appLayers = ['frontend'], model
 }
 
 /** Reglas de cada nodo: obligatorias (no editables) y configurables (editables antes de ejecutar). */
-export function rulesFor(plan, projectId) {
+export function rulesFor(plan, projectId, companyAgents = {}) {
   const ctx = projectContext(projectId);
   const projectForbidden = ctx.scope?.forbidden ?? [];
   const out = {};
@@ -262,9 +269,12 @@ export function rulesFor(plan, projectId) {
       ...(def?.forbiddenActions ?? []).map((a) => ({ text: `Prohibido: ${a}`, source: `skill-registry/${node.agentId}.yml` })),
       ...(node.agentId === 'frontend-integration-agent' ? projectForbidden.map((f) => ({ text: `Prohibido: ${f}`, source: `projects/${projectId}/project-context.yml` })) : []),
     ];
+    // Ajustes de la empresa (versionados): se suman a las obligatorias y reemplazan las configurables por defecto.
+    const company = companyAgents[node.agentId ?? node.id] ?? companyAgents[node.id];
+    if (company) mandatory.push(...(company.mandatory ?? []).map((text) => ({ text, source: `Empresa · v${company.version}` })));
     out[node.id] = {
       mandatory: node.kind === 'input' || node.kind === 'output' ? [] : mandatory,
-      configurable: DEFAULT_CONFIGURABLE[node.id] ?? [],
+      configurable: company?.configurable?.length ? company.configurable : DEFAULT_CONFIGURABLE[node.id] ?? [],
     };
   }
   return out;

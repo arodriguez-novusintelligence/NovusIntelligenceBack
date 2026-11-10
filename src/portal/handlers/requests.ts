@@ -37,6 +37,10 @@ export interface RequestServices {
   presign(key: string): Promise<string>;
   /** Lee una evidencia del bucket (null si no existe). */
   readEvidence(key: string): Promise<Buffer | null>;
+  /** Detiene la ejecución en curso del ejecutor (CodeBuild StopBuild). */
+  stopRun(buildId: string): Promise<void>;
+  /** Flujo de la empresa (plantilla vigente). */
+  getFlow(companyId: string, flowId: string): Promise<{ flowId: string; name: string; version: number; agents: string[]; archived?: boolean } | null>;
 }
 
 interface Ctx {
@@ -172,8 +176,15 @@ export function createRequestsHandler(
     const app = appId ? getApp(ctx.principal.companyId, appId) : null;
     if (!app) return errorResponse(400, ctx.requestId, 'NO_APP', 'Tu empresa todavía no tiene una aplicación conectada a NADF.');
 
+    let flowTemplate: RequestRecord['flowTemplate'] = null;
+    if (typeof input.flowId === 'string' && input.flowId) {
+      const flow = await services.getFlow(ctx.principal.companyId, input.flowId);
+      if (!flow || flow.archived) return errorResponse(400, ctx.requestId, 'INVALID_FLOW', 'Ese flujo no existe o fue archivado.');
+      flowTemplate = { id: flow.flowId, name: flow.name, version: flow.version, agents: flow.agents };
+    }
     const at = now().toISOString();
     const record: RequestRecord = {
+      flowTemplate,
       requestId: newId(),
       companyId: ctx.principal.companyId,
       appId: app.id,
@@ -418,6 +429,76 @@ export function createRequestsHandler(
     return json(200, { ok: true, requestId: ctx.requestId, export: bundle });
   }
 
+  const canControl = (ctx: Ctx, r: RequestRecord) => isOwner(ctx, r) || can(ctx, 'approvals.decide') || can(ctx, 'deployments.operate');
+  const RUNNING_NODE = ['RUNNING', 'QUEUED', 'WAITING_DEPENDENCY'];
+
+  function closeNodes(r: RequestRecord, statuses: string[], text: string): Record<string, NodeState> {
+    const out: Record<string, NodeState> = {};
+    for (const [id, st] of Object.entries(r.nodeState ?? {})) {
+      if (!statuses.includes(st.status)) continue;
+      const attempts = (st.attempts ?? []).map((a, i, all) => (i === all.length - 1 && a.status === 'RUNNING' ? { ...a, status: 'CANCELLED' as const, endedAt: now().toISOString() } : a));
+      out[id] = { ...st, attempts, status: 'CANCELLED', endedAt: now().toISOString(), lastEvent: text };
+    }
+    return out;
+  }
+
+  /** Detener: corta la ejecución en curso; se puede reanudar después. No se permite durante un despliegue. */
+  async function stop(ctx: Ctx, event: Event, id: string) {
+    const r = await load(ctx, id);
+    if (!r) return notFound(ctx);
+    if (!canControl(ctx, r)) return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Tu rol no permite detener esta ejecución.');
+    if (['approved', 'deploying', 'rollback_approved', 'rolling_back'].includes(r.status)) {
+      return conflict(ctx, 'No se puede detener un despliegue o rollback en curso: PROD quedaría a medias. Espera a que termine (tiene rollback automático).');
+    }
+    if (!['planning', 'queued', 'developing'].includes(r.status)) return conflict(ctx, 'No hay una ejecución en curso que detener.');
+    const at = now().toISOString();
+    const reason = typeof body(event).reason === 'string' ? String(body(event).reason).slice(0, 500) : undefined;
+    const ok = await requests.transition(r.companyId, r.requestId, [r.status], { status: 'stopped', stage: 'stopped', stopped: { by: ctx.actor, at, reason, previousStatus: r.status }, updatedAt: at });
+    if (!ok) return conflict(ctx);
+    if (r.buildId) await services.stopRun(r.buildId).catch((e) => log({ level: 'warn', requestId: ctx.requestId, event: 'runner.stop_failed', message: (e as Error).message }));
+    await requests.setNodes(r.companyId, r.requestId, closeNodes(r, RUNNING_NODE, `Detenido por ${who(ctx.actor)}.`)).catch(() => undefined);
+    await addEvent(r.requestId, `${who(ctx.actor)} detuvo la ejecución${reason ? `: ${reason}` : '.'} Se puede reanudar.`, 'warning', { eventType: 'EXECUTION_STOPPED' });
+    return json(200, { ok: true, requestId: ctx.requestId, status: 'stopped' });
+  }
+
+  /** Reanudar: vuelve a planificar (si se detuvo planificando) o re-ejecuta el plan en una nueva iteración. */
+  async function resume(ctx: Ctx, id: string) {
+    const r = await load(ctx, id);
+    if (!r) return notFound(ctx);
+    if (!canControl(ctx, r)) return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Tu rol no permite reanudar esta ejecución.');
+    if (r.status !== 'stopped') return conflict(ctx, 'Solo se reanuda una ejecución detenida.');
+    const at = now().toISOString();
+    const replan = !r.workflow || r.stopped?.previousStatus === 'planning';
+    const next: Partial<RequestRecord> = replan ? { status: 'planning', stage: 'planning', error: null, updatedAt: at } : { status: 'queued', stage: 'queued', iteration: r.iteration + 1, error: null, updatedAt: at };
+    const ok = await requests.transition(r.companyId, r.requestId, ['stopped'], next);
+    if (!ok) return conflict(ctx);
+    if (!replan) await requests.setNodes(r.companyId, r.requestId, nodesAfterDecision({ ...r, status: 'stopped' }, 'changes', ctx.actor)).catch(() => undefined);
+    await addEvent(r.requestId, `${who(ctx.actor)} reanudó la ejecución.`, 'stage', { eventType: 'EXECUTION_RESUMED' });
+    const failed = await launch(ctx, { ...r, ...next } as RequestRecord, replan ? 'plan' : 'develop');
+    return failed ?? json(200, { ok: true, requestId: ctx.requestId, status: next.status });
+  }
+
+  /** Cancelar: cierra la solicitud definitivamente (detiene lo que esté corriendo). */
+  async function cancel(ctx: Ctx, event: Event, id: string) {
+    const r = await load(ctx, id);
+    if (!r) return notFound(ctx);
+    if (!canControl(ctx, r)) return errorResponse(403, ctx.requestId, 'FORBIDDEN', 'Tu rol no permite cancelar esta solicitud.');
+    if (['approved', 'deploying', 'rollback_approved', 'rolling_back'].includes(r.status)) {
+      return conflict(ctx, 'No se puede cancelar durante un despliegue o rollback en curso.');
+    }
+    if (['deployed', 'rejected', 'cancelled', 'rolled_back'].includes(r.status)) return conflict(ctx, 'La solicitud ya está cerrada.');
+    const at = now().toISOString();
+    const reason = typeof body(event).reason === 'string' ? String(body(event).reason).slice(0, 500) : undefined;
+    const ok = await requests.transition(r.companyId, r.requestId, [r.status], { status: 'cancelled', stage: 'cancelled', cancelled: { by: ctx.actor, at, reason }, updatedAt: at });
+    if (!ok) return conflict(ctx);
+    if (r.buildId && ['planning', 'queued', 'developing'].includes(r.status)) await services.stopRun(r.buildId).catch(() => undefined);
+    const nodes = closeNodes(r, [...RUNNING_NODE, 'PENDING', 'WAITING_APPROVAL'], `Cancelado por ${who(ctx.actor)}.`);
+    if (r.workflow && !r.workflow.legacy) nodes.result = { ...(r.nodeState?.result ?? { attempts: [] }), status: 'CANCELLED', endedAt: at, lastEvent: 'Solicitud cancelada.' } as NodeState;
+    await requests.setNodes(r.companyId, r.requestId, nodes).catch(() => undefined);
+    await addEvent(r.requestId, `${who(ctx.actor)} canceló la solicitud${reason ? `: ${reason}` : '.'}${r.prNumber ? ` El PR #${r.prNumber} queda abierto: ciérralo en GitHub si no se usará.` : ''}`, 'warning', { eventType: 'EXECUTION_CANCELLED' });
+    return json(200, { ok: true, requestId: ctx.requestId, status: 'cancelled' });
+  }
+
   async function previewSession(ctx: Ctx, id: string) {
     const r = await load(ctx, id);
     if (!r) return notFound(ctx);
@@ -467,6 +548,12 @@ export function createRequestsHandler(
           return await nodeIo(ctx, event, id, nodeId);
         case 'GET /api/v1/portal/requests/{id}/export':
           return await exportRun(ctx, event, id);
+        case 'POST /api/v1/portal/requests/{id}/stop':
+          return await stop(ctx, event, id);
+        case 'POST /api/v1/portal/requests/{id}/resume':
+          return await resume(ctx, id);
+        case 'POST /api/v1/portal/requests/{id}/cancel':
+          return await cancel(ctx, event, id);
         case 'POST /api/v1/portal/requests/{id}/preview-session':
           return await previewSession(ctx, id);
         default:
