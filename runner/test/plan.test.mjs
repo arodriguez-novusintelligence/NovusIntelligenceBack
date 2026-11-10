@@ -146,3 +146,10 @@ test('modelo de desarrollo por naturaleza: Sonnet para ajustes visuales, Opus pa
   assert.equal(planWith(sig({ naturaleza: 'ajuste_visual', changeTypes: ['color'] })).policy.models.development, 'claude-sonnet-5-5');
   assert.equal(planWith(sig()).policy.models.development, 'claude-opus-5-5');
 });
+
+test('revisión combinada: un esquema con los dos veredictos', async () => {
+  const { SCHEMAS } = await import('../lib/llm.mjs');
+  assert.deepEqual(SCHEMAS.combinedReview.required, ['seguridad', 'revision']);
+  assert.deepEqual(SCHEMAS.combinedReview.properties.seguridad.required, ['veredicto', 'hallazgos', 'resumen']);
+  assert.ok(SCHEMAS.classification.required.includes('archivos_candidatos'));
+});

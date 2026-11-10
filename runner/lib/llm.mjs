@@ -44,7 +44,28 @@ export function createLlm({ apiKey, model }) {
   return { json };
 }
 
+const REVIEW = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    veredicto: { type: 'string', enum: ['aprobado', 'con_observaciones', 'bloqueante'] },
+    hallazgos: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { severidad: { type: 'string', enum: ['baja', 'media', 'alta'] }, archivo: { type: 'string' }, detalle: { type: 'string' } },
+        required: ['severidad', 'archivo', 'detalle'],
+      },
+    },
+    resumen: { type: 'string' },
+  },
+  required: ['veredicto', 'hallazgos', 'resumen'],
+};
+
 export const SCHEMAS = {
+  /** Seguridad + Revisor en una sola llamada (el diff se envía una vez). */
+  combinedReview: { type: 'object', additionalProperties: false, properties: { seguridad: REVIEW, revision: REVIEW }, required: ['seguridad', 'revision'] },
   classification: {
     type: 'object',
     additionalProperties: false,
@@ -62,10 +83,11 @@ export const SCHEMAS = {
       tamano: { type: 'string', enum: ['pequena', 'grande'] },
       ambito_critico: { type: 'boolean' },
       motivo_critico: { type: 'string' },
+      archivos_candidatos: { type: 'array', items: { type: 'string' } },
       criterios_aceptacion: { type: 'array', items: { type: 'string' } },
       preguntas: { type: 'array', items: { type: 'string' } },
     },
-    required: ['resumen', 'description', 'changeTypes', 'layers', 'backendRequired', 'frontendRequired', 'ambiguous', 'dominio', 'riesgo', 'naturaleza', 'tamano', 'ambito_critico', 'motivo_critico', 'criterios_aceptacion', 'preguntas'],
+    required: ['resumen', 'description', 'changeTypes', 'layers', 'backendRequired', 'frontendRequired', 'ambiguous', 'dominio', 'riesgo', 'naturaleza', 'tamano', 'ambito_critico', 'motivo_critico', 'archivos_candidatos', 'criterios_aceptacion', 'preguntas'],
   },
   plan: {
     type: 'object',

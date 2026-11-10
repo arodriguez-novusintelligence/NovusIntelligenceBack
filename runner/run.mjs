@@ -15,6 +15,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { appSession, capture } from './lib/browser.mjs';
 import { attachmentBlocks, attachmentsText, loadAttachments } from './lib/attachments.mjs';
+import { mapText, repoMap, validCandidates } from './lib/repomap.mjs';
 import { diffStrings, crawl, localFetcher, previewIndex, uiStrings, entryScripts } from './lib/bundle.mjs';
 import { runClaude } from './lib/claude.mjs';
 import { agentDefinition, agentPolicy, buildPlan, manifest, rulesFor } from './lib/framework.mjs';
@@ -204,6 +205,16 @@ async function plan() {
   if (!(await state.update({ status: 'planning', stage: 'planning', error: null }, ['planning', 'queued_plan']))) return console.log('La solicitud no está para planificar; se ignora.');
   const claudeKey = await secret('/nadf/platform/claude-api-key');
   const policy = agentPolicy();
+  // Mapa del repo (caché por SHA de main): orienta al Analista y luego al Desarrollador sin explorar todo el repo.
+  let map = null;
+  try {
+    const ghApp = await secret('/nadf/platform/github-app', true);
+    const tok = await installationToken(ghApp, cfg.app.repo.installationId, cfg.app.repo.name);
+    const ref = await api(`/repos/${cfg.app.repo.owner}/${cfg.app.repo.name}/git/ref/heads/${cfg.app.repo.defaultBranch}`, tok);
+    map = await repoMap({ s3, bucket: cfg.evidence, ghToken: tok, owner: cfg.app.repo.owner, name: cfg.app.repo.name, sha: ref.object.sha, maxChars: policy?.context_limits?.repo_map_chars ?? 24000 });
+  } catch (error) {
+    console.error('Sin mapa del repo (se sigue sin él):', error.message);
+  }
   const llm = createLlm({ apiKey: claudeKey, model: policy?.models?.analysis ?? cfg.model });
   state.initNodes({});
   await state.update({ nodeState: {} });
@@ -228,12 +239,13 @@ async function plan() {
       '"tamano": "grande" solo si la funcionalidad nueva abarca varias pantallas o flujos; si no, "pequena".',
       '"ambito_critico" = true solo si el cambio toca autenticación/sesiones, pagos o cobros, datos personales, secretos, permisos o migración de datos. Mencionar un tema no lo vuelve crítico: importa si el CÓDIGO a cambiar lo toca. "motivo_critico": explica cuál (o vacío).',
       '"backendRequired" = true solo si el pedido no se puede cumplir sin cambiar servicios o datos del backend.',
+      map ? '"archivos_candidatos": hasta 12 rutas EXACTAS del mapa del repositorio donde probablemente está lo que hay que cambiar (empieza por la pantalla o componente y su servicio). Si no hay mapa, deja la lista vacía.' : '"archivos_candidatos": deja la lista vacía.',
     ].join('\n');
     const att = await loadAttachments({ s3, bucket: cfg.evidence, list: req.attachments ?? [], dir: join(cfg.work, 'adjuntos') });
     const { blocks, skipped } = await attachmentBlocks(att.files);
     if (att.files.length) await emit('tool', `Leyendo ${att.files.length} adjunto(s): ${att.files.map((f) => f.name).join(', ')}`);
     if (skipped.length) await emit('warning', `Adjuntos demasiado grandes para el análisis visual: ${skipped.join(', ')}.`);
-    const user = [`Solicitud del funcional:\n"""\n${req.prompt}\n"""`, attachmentsText(att.files).replace(/ → .*$/gm, '')].filter(Boolean).join('\n\n');
+    const user = [`Solicitud del funcional:\n"""\n${req.prompt}\n"""`, attachmentsText(att.files).replace(/ → .*$/gm, ''), map ? `Mapa del repositorio ${cfg.app.repo.name} (main @ ${map.sha.slice(0, 7)}):\n${mapText(map)}` : ''].filter(Boolean).join('\n\n');
     const { data, metrics } = await llm.json({ system, user, blocks, schema: SCHEMAS.classification });
     await emit('thought', data.resumen);
     const ioKey = await saveIo('requirement-classification-agent', {
@@ -244,6 +256,7 @@ async function plan() {
     return { text: `Clasificado: ${data.changeTypes.join(', ') || 'sin tipo'} · riesgo ${data.riesgo}.`, output: data, metrics, ioKey, data };
   });
   const signals = classification.data;
+  const candidates = validCandidates(signals.archivos_candidatos, map);
   if (req.scopeOverride === 'web_only' && signals.backendRequired) {
     signals.backendRequired = false;
     await state.emit('info', 'Alcance acordado: solo la parte web (decisión registrada). La dependencia de backend queda documentada en el informe.', { nodeId: 'orchestrator' });
@@ -278,6 +291,7 @@ async function plan() {
     rules,
     agentOverrides: overrides,
     classification: signals,
+    repoContext: map ? { sha: map.sha, candidates, routes: map.routes?.length ?? 0, files: map.files.length, cached: map.cached } : null,
     title: req.title ?? signals.resumen?.slice(0, 90),
     error: p.blocked ? { code: 'PLAN_BLOCKED', message: `${p.blockReason}${signals.preguntas?.length ? ` Preguntas: ${signals.preguntas.join(' ')}` : ''}` } : null,
   }, ['planning']);
@@ -370,7 +384,14 @@ async function develop() {
   const attBlocks = (await attachmentBlocks(att.files)).blocks;
 
   // ---- Planificador / Arquitecto (solo si el plan los incluye).
-  const fileList = (await git(['ls-files', 'packages/shell/src', 'packages/shared/src'])).out.split('\n').filter(Boolean).slice(0, fileLimit).join('\n');
+  let map = null;
+  try {
+    map = await repoMap({ s3, bucket: cfg.evidence, ghToken, owner, name, sha: baseSha, maxChars: pol?.limits?.repo_map_chars ?? 24000 });
+  } catch (error) {
+    console.error('Sin mapa del repo:', error.message);
+  }
+  const fileList = map ? mapText(map) : (await git(['ls-files', 'packages/shell/src', 'packages/shared/src'])).out.split('\n').filter(Boolean).slice(0, fileLimit).join('\n');
+  let candidates = validCandidates(req.repoContext?.candidates ?? req.classification?.archivos_candidatos, map);
   let planOut = null;
   let designOut = null;
   for (const [id, schema] of [['planner-agent', SCHEMAS.plan], ['architect-agent', SCHEMAS.design]]) {
@@ -380,6 +401,7 @@ async function develop() {
       const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
       const user = [`Solicitud:\n"""\n${req.prompt}\n"""`, attText.replace(/ → .*$/gm, ''), `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}`, planOut ? `Plan:\n${JSON.stringify(planOut)}` : '', `Archivos del repo (${name}):\n${fileList}`].filter(Boolean).join('\n\n');
       const { data, metrics } = await llm.json({ system, user, blocks: attBlocks, schema });
+      if (id === 'planner-agent') candidates = [...new Set([...candidates, ...validCandidates(data.archivos_candidatos, map)])].slice(0, 15);
       await emit('thought', (data.pasos ?? data.decisiones ?? []).slice(0, 6).join('\n') || data['diseño'] || 'Listo.');
       const ioKey = await saveIo(id, { prompt: { base: def.prompt, instrucciones: ruleText(rulesOf(req, id)), solicitud: req.prompt, contexto: { archivos: 'listado de packages/shell/src y packages/shared/src' } }, input: { criterios: criteria }, output: data });
       return { text: 'Completado.', output: data, metrics, ioKey, data };
@@ -426,6 +448,12 @@ async function develop() {
       '"""',
       criteria.length ? `Criterios de aceptación (Analista):\n${criteria.map((c) => `- ${c}`).join('\n')}` : '',
       attText ? `${attText}\nAbre las imágenes y documentos con la herramienta Read si los necesitas. No copies los adjuntos al repositorio.` : '',
+      candidates.length
+        ? `Archivos candidatos (identificados por el Analista sobre el mapa del repo; EMPIEZA POR AQUÍ):\n${candidates.map((c) => `- ${c}`).join('\n')}`
+        : '',
+      map
+        ? `Mapa del repositorio (main @ ${map.sha.slice(0, 7)}), para orientarte sin recorrerlo:\n${mapText(map).slice(0, 14000)}\n\nEficiencia: usa Grep/Glob dirigidos a partir de los candidatos y del mapa; no leas el repositorio completo; en archivos grandes lee solo las secciones necesarias (offset/limit).`
+        : '',
       planOut ? `Plan del Planificador:\n${planOut.pasos.map((s) => `- ${s}`).join('\n')}` : '',
       designOut ? `Diseño del Arquitecto:\n${designOut['diseño']}` : '',
       cfg.iteration > 1
@@ -455,7 +483,7 @@ async function develop() {
     files = changed.filter((p) => !reverted.includes(p) && p !== '.env.prod' && p !== 'nadf-report.json');
     const ioKey = await saveIo('frontend-integration-agent', {
       prompt: { base: promptOf(req, 'frontend-integration-agent'), instrucciones: instructions, solicitud: prompt, contexto: { repo: `${owner}/${name}`, rama: branch, base: baseSha }, version: `${fw.branch ?? ''}@${(fw.sha ?? '').slice(0, 7)}` },
-      input: { criterios: criteria, plan: planOut, diseño: designOut },
+      input: { criterios: criteria, plan: planOut, diseño: designOut, candidatos: candidates, mapa: map ? { sha: map.sha, archivos: map.files.length, enCache: map.cached } : null },
       output: report,
       artefactos: { archivos: files, revertidos: reverted },
     });
@@ -530,14 +558,34 @@ async function develop() {
       return { text: reverted.length ? `Revertí cambios en archivos protegidos: ${reverted.join(', ')}. Sin secretos.` : 'Sin archivos protegidos ni secretos en el cambio.', ioKey, output: { revertidos: reverted } };
     }),
   ];
+  // Si también corre el Revisor, Seguridad y Revisor van en UNA llamada: el diff se envía una sola vez.
+  const combine = willRun(req, 'security-agent') && willRun(req, 'reviewer-agent');
+  let combinedReview = null;
   for (const id of ['security-agent']) {
     if (!willRun(req, id)) continue;
     const def = agentDefinition(id);
     branches.push(
-      step(id, 'El agente de Seguridad revisa el diff.', async (emit) => {
-        const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\n${reviewPolicy}\nResponde solo con el JSON pedido, en español.`;
-        const user = `Solicitud:\n${req.prompt}\n\nDiff:\n${diff}`;
-        const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review });
+      step(id, combine ? 'Seguridad y Revisor revisan el diff en una sola llamada.' : 'El agente de Seguridad revisa el diff.', async (emit) => {
+        let data;
+        let metrics;
+        if (combine) {
+          const system = [
+            '# Rol 1: Seguridad', promptOf(req, 'security-agent'), `Reglas:\n${ruleText(rulesOf(req, 'security-agent'))}`,
+            '# Rol 2: Revisor', promptOf(req, 'reviewer-agent'), `Reglas:\n${ruleText(rulesOf(req, 'reviewer-agent'))}`,
+            reviewPolicy,
+            'Entrega dos veredictos independientes: "seguridad" (riesgos de seguridad del diff) y "revision" (cumple lo pedido y no rompe funcionalidades). Responde solo con el JSON pedido, en español.',
+          ].join('\n\n');
+          const user = `Solicitud:\n${req.prompt}\n\nCriterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}\n\nDiff:\n${diff}`;
+          const out = await llm.json({ system, user, schema: SCHEMAS.combinedReview, maxTokens: 10000 });
+          data = out.data.seguridad;
+          metrics = { ...out.metrics, combinada: true };
+          const revIo = await saveIo('reviewer-agent', { prompt: { base: agentDefinition('reviewer-agent').prompt, instrucciones: ruleText(rulesOf(req, 'reviewer-agent')), solicitud: req.prompt, contexto: { criterios: criteria, nota: 'Llamada combinada con Seguridad' } }, input: { archivos: files }, output: out.data.revision });
+          combinedReview = { data: out.data.revision, ioKey: revIo, model: out.metrics.model };
+        } else {
+          const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\n${reviewPolicy}\nResponde solo con el JSON pedido, en español.`;
+          const user = `Solicitud:\n${req.prompt}\n\nDiff:\n${diff}`;
+          ({ data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review }));
+        }
         await emit('thought', data.resumen);
         const ioKey = await saveIo(id, { prompt: { base: def.prompt, instrucciones: ruleText(rulesOf(req, id)), solicitud: req.prompt, contexto: { diff: `${files.length} archivo(s)` } }, input: { archivos: files }, output: data });
         if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'SECURITY_REVIEW_BLOCKED', `Seguridad bloqueó el cambio: ${data.resumen}`, { metrics, output: data, ioKey });
@@ -591,6 +639,13 @@ async function develop() {
   }
   async function reviewerRun(emit) {
     const def = agentDefinition('reviewer-agent');
+    if (combinedReview) {
+      const data = combinedReview.data;
+      await emit('thought', data.resumen);
+      const metrics = { model: combinedReview.model, combinada: true, nota: 'Incluido en la llamada de Seguridad (sin tokens adicionales).' };
+      if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'REVIEW_BLOCKED', `El Revisor bloqueó el cambio: ${data.resumen}`, { metrics, output: data, ioKey: combinedReview.ioKey });
+      return { text: `Veredicto: ${data.veredicto.replace('_', ' ')} (revisión combinada).`, output: data, metrics, ioKey: combinedReview.ioKey };
+    }
     {
       const system = `${promptOf(req, 'reviewer-agent')}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'reviewer-agent'))}\n${reviewPolicy}\nResponde solo con el JSON pedido, en español.`;
       const user = `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}\n\nDiff:\n${diff}`;
