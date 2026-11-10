@@ -143,7 +143,7 @@ async function step(id, startText, fn) {
 }
 
 async function skipRest(req, ids, why) {
-  for (const id of ids) if (planned(req, id) && state.nodeStatus(id) !== NODE.COMPLETED) await state.nodeSet(id, NODE.SKIPPED, why);
+  for (const id of ids) if (planned(req, id) && state.nodeStatus(id) !== NODE.COMPLETED) await state.nodeSet(id, NODE.SKIPPED, `${planned(req, id).label} — ${why}`);
 }
 
 // ---------------------------------------------------------------- plan
@@ -201,7 +201,7 @@ async function plan() {
   const p = result.p;
   for (const n of p.nodes) {
     if (['request', 'requirement-classification-agent', 'complexity-router', 'orchestrator'].includes(n.id)) continue;
-    await state.nodeSet(n.id, n.planned === 'skip' ? NODE.SKIPPED : NODE.PENDING, n.planned === 'skip' ? n.reason : undefined);
+    await state.nodeSet(n.id, n.planned === 'skip' ? NODE.SKIPPED : NODE.PENDING, n.planned === 'skip' ? `${n.label} — ${n.reason}` : undefined);
   }
   const workflow = { ...p, framework: fw, createdAt: new Date().toISOString(), executionId: cfg.buildId };
   const rules = { version: 1, locked: false, nodes: result.rules, history: [{ version: 1, at: new Date().toISOString(), by: 'NADF (valores por defecto del framework)', note: 'Reglas iniciales del plan' }] };
