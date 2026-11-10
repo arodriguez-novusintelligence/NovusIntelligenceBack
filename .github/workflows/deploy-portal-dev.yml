@@ -1,0 +1,35 @@
+# Deploy DEV del servicio nadf-portal (serverless-portal.yml) — manual mientras se valida la fase 0.
+# Requiere permisos de CloudFormation, Cognito, DynamoDB, S3, CloudFront, Lambda, API Gateway e IAM
+# para el usuario de AWS del secreto.
+name: Deploy portal NADF (DEV)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-dev-portal-back
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Serverless deploy
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: sa-east-1
+          PORTAL_EXTRA_ORIGIN: ${{ vars.PORTAL_EXTRA_ORIGIN }}
+          PORTAL_URL: ${{ vars.PORTAL_URL }}
+        run: npx serverless deploy --config serverless-portal.yml --stage dev --region sa-east-1
