@@ -96,3 +96,48 @@ test('reglas de la empresa se suman a las obligatorias y reemplazan las configur
   assert.ok(dev.mandatory.some((m) => m.source === 'Plataforma NADF'));
   assert.deepEqual(dev.configurable, ['Preferir tokens de color existentes']);
 });
+
+// ---------------- Política por naturaleza (agent-policy.yml)
+const sig = (over) => ({ description: 'cambio', changeTypes: ['component'], layers: ['frontend'], backendRequired: false, frontendRequired: true, ambiguous: false, naturaleza: 'evolutivo', tamano: 'pequena', ambito_critico: false, ...over });
+const planWith = (s) => buildPlan(decideComplexity(s), { projectId: 'doevents', appLayers: ['frontend'], model: 'm', signals: s });
+
+test('evolutivo: solo Revisor como opcional; sin Planificador, Arquitecto ni ADR', () => {
+  const p = planWith(sig());
+  assert.equal(node(p, 'reviewer-agent').planned, 'run');
+  for (const id of ['planner-agent', 'architect-agent', 'security-agent']) assert.equal(node(p, id).planned, 'skip', id);
+  assert.match(node(p, 'architect-agent').reason, /no requiere diseño de arquitectura ni ADR/);
+  assert.equal(p.policy.adrRequired, false);
+  assert.equal(p.policy.models.analysis, 'claude-sonnet-5-5');
+  assert.equal(p.policy.budgetUsd, 8);
+});
+
+test('evolutivo crítico (pagos): suma Seguridad, NO Arquitecto', () => {
+  const p = planWith(sig({ ambito_critico: true, motivo_critico: 'pagos' }));
+  assert.equal(node(p, 'security-agent').planned, 'run');
+  assert.match(node(p, 'security-agent').reason, /pagos/);
+  assert.equal(node(p, 'architect-agent').planned, 'skip');
+  assert.equal(node(p, 'planner-agent').planned, 'skip');
+});
+
+test('caso licencias PRO: necesita backend y solo hay web → se detiene en el plan sin gastar', () => {
+  const p = planWith(sig({ backendRequired: true, layers: ['frontend', 'backend'], ambito_critico: true, motivo_critico: 'licencias y cobros' }));
+  assert.equal(p.blocked, true);
+  assert.match(p.blockReason, /backend/);
+  assert.equal(node(p, 'frontend-integration-agent').planned, 'skip');
+});
+
+test('nueva funcionalidad grande: Planificador + Revisor; cambio arquitectónico: + Arquitecto y ADR', () => {
+  const nueva = planWith(sig({ naturaleza: 'nueva_funcionalidad', tamano: 'grande' }));
+  assert.equal(node(nueva, 'planner-agent').planned, 'run');
+  assert.equal(node(nueva, 'architect-agent').planned, 'skip');
+  const arq = planWith(sig({ naturaleza: 'cambio_arquitectonico' }));
+  assert.equal(node(arq, 'architect-agent').planned, 'run');
+  assert.equal(arq.policy.adrRequired, true);
+  assert.equal(arq.policy.budgetUsd, 25);
+});
+
+test('ajuste visual: ningún agente opcional y presupuesto mínimo', () => {
+  const p = planWith(sig({ naturaleza: 'ajuste_visual', changeTypes: ['color'] }));
+  for (const id of ['planner-agent', 'architect-agent', 'security-agent', 'reviewer-agent']) assert.equal(node(p, id).planned, 'skip', id);
+  assert.equal(p.policy.budgetUsd, 3);
+});

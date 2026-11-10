@@ -5,10 +5,11 @@ import Anthropic from '@anthropic-ai/sdk';
 export function createLlm({ apiKey, model }) {
   const client = new Anthropic({ apiKey });
 
-  async function json({ system, user, blocks = [], schema, maxTokens = 8000 }) {
+  async function json({ system, user, blocks = [], schema, maxTokens = 8000, model: override }) {
     const started = Date.now();
+    const useModel = override ?? model;
     const res = await client.messages.create({
-      model,
+      model: useModel,
       max_tokens: maxTokens,
       system,
       messages: [{ role: 'user', content: blocks.length ? [...blocks, { type: 'text', text: user }] : user }],
@@ -30,7 +31,7 @@ export function createLlm({ apiKey, model }) {
     return {
       data,
       metrics: {
-        model,
+        model: useModel,
         inputTokens,
         outputTokens,
         // Sin costo estimado: la API no lo entrega y no se inventan métricas.
@@ -57,10 +58,14 @@ export const SCHEMAS = {
       ambiguous: { type: 'boolean' },
       dominio: { type: 'string' },
       riesgo: { type: 'string', enum: ['bajo', 'medio', 'alto'] },
+      naturaleza: { type: 'string', enum: ['ajuste_visual', 'evolutivo', 'nueva_funcionalidad', 'cambio_arquitectonico'] },
+      tamano: { type: 'string', enum: ['pequena', 'grande'] },
+      ambito_critico: { type: 'boolean' },
+      motivo_critico: { type: 'string' },
       criterios_aceptacion: { type: 'array', items: { type: 'string' } },
       preguntas: { type: 'array', items: { type: 'string' } },
     },
-    required: ['resumen', 'description', 'changeTypes', 'layers', 'backendRequired', 'frontendRequired', 'ambiguous', 'dominio', 'riesgo', 'criterios_aceptacion', 'preguntas'],
+    required: ['resumen', 'description', 'changeTypes', 'layers', 'backendRequired', 'frontendRequired', 'ambiguous', 'dominio', 'riesgo', 'naturaleza', 'tamano', 'ambito_critico', 'motivo_critico', 'criterios_aceptacion', 'preguntas'],
   },
   plan: {
     type: 'object',

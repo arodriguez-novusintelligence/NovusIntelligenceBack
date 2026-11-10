@@ -17,7 +17,7 @@ import { appSession, capture } from './lib/browser.mjs';
 import { attachmentBlocks, attachmentsText, loadAttachments } from './lib/attachments.mjs';
 import { diffStrings, crawl, localFetcher, previewIndex, uiStrings, entryScripts } from './lib/bundle.mjs';
 import { runClaude } from './lib/claude.mjs';
-import { agentDefinition, buildPlan, manifest, rulesFor } from './lib/framework.mjs';
+import { agentDefinition, agentPolicy, buildPlan, manifest, rulesFor } from './lib/framework.mjs';
 import { api, gitAuthArgs, installationToken } from './lib/github.mjs';
 import { createLlm, SCHEMAS } from './lib/llm.mjs';
 import {
@@ -155,6 +155,9 @@ async function step(id, startText, fn) {
   } catch (error) {
     const stop = error instanceof Stop ? error : null;
     await state.nodeEnd(id, stop?.status === 'blocked' ? NODE.BLOCKED : NODE.FAILED, stop?.message ?? `Error: ${error.message}`, {
+      metrics: stop?.extra?.metrics,
+      output: stop?.extra?.output,
+      ioKey: stop?.extra?.ioKey,
       error: { code: stop?.code ?? error.code ?? 'NODE_ERROR', message: stop?.message ?? error.message },
     });
     throw error;
@@ -171,7 +174,8 @@ async function plan() {
   const req = await state.get();
   if (!(await state.update({ status: 'planning', stage: 'planning', error: null }, ['planning', 'queued_plan']))) return console.log('La solicitud no está para planificar; se ignora.');
   const claudeKey = await secret('/nadf/platform/claude-api-key');
-  const llm = createLlm({ apiKey: claudeKey, model: cfg.model });
+  const policy = agentPolicy();
+  const llm = createLlm({ apiKey: claudeKey, model: policy?.models?.analysis ?? cfg.model });
   state.initNodes({});
   await state.update({ nodeState: {} });
 
@@ -190,6 +194,11 @@ async function plan() {
       'Responde SOLO con el JSON pedido. "changeTypes" usa estos valores cuando apliquen: visual, content, cosmetic, copy, typography, color, asset, image, banner, spacing, style, static_page, navigation, component, frontend_validation, accessibility, query, read_endpoint, backend_config, business_logic, integration.',
       '"layers" usa: frontend, backend, database, api, cloud. "ambiguous" = true solo si sin preguntar no se puede implementar con seguridad.',
       'Escribe "resumen", "criterios_aceptacion" y "preguntas" en español, para una persona no técnica.',
+      'Clasifica la "naturaleza" del cambio (decide qué agentes y cuánto presupuesto se usan; sé preciso, no inflado):',
+      ...Object.entries(policy?.naturalezas ?? {}).map(([k, v]) => `- ${k}: ${v}`),
+      '"tamano": "grande" solo si la funcionalidad nueva abarca varias pantallas o flujos; si no, "pequena".',
+      '"ambito_critico" = true solo si el cambio toca autenticación/sesiones, pagos o cobros, datos personales, secretos, permisos o migración de datos. Mencionar un tema no lo vuelve crítico: importa si el CÓDIGO a cambiar lo toca. "motivo_critico": explica cuál (o vacío).',
+      '"backendRequired" = true solo si el pedido no se puede cumplir sin cambiar servicios o datos del backend.',
     ].join('\n');
     const att = await loadAttachments({ s3, bucket: cfg.evidence, list: req.attachments ?? [], dir: join(cfg.work, 'adjuntos') });
     const { blocks, skipped } = await attachmentBlocks(att.files);
@@ -209,14 +218,14 @@ async function plan() {
 
   const { decideComplexity } = await import('./vendor/routing.mjs');
   const decision = await step('complexity-router', 'El Complexity Router elige el perfil mínimo suficiente.', async () => {
-    const input = { source: 'nadf-portal', description: `${req.prompt}\n${signals.description}`, changeTypes: signals.changeTypes, layers: signals.layers, backendRequired: signals.backendRequired, frontendRequired: signals.frontendRequired, ambiguous: signals.ambiguous };
+    const input = { source: 'nadf-portal', description: signals.description, changeTypes: signals.changeTypes, layers: signals.layers, backendRequired: signals.backendRequired, frontendRequired: signals.frontendRequired, ambiguous: signals.ambiguous };
     const d = decideComplexity(input);
     const ioKey = await saveIo('complexity-router', { prompt: null, input, output: d, tool: 'decideComplexity (prototypes/m6-cloud-agent/src/complexity-routing)' });
     return { text: `Perfil ${d.profile} (${d.level}) · confianza ${d.confidence}. ${d.rationale[0] ?? ''}`, output: d, ioKey, d };
   });
 
   const result = await step('orchestrator', 'El Orquestador arma el plan con los presets del proyecto.', async () => {
-    const p = buildPlan(decision.d, { projectId: cfg.companyId, appLayers: ['frontend'], model: cfg.model, flow: req.flowTemplate ?? null });
+    const p = buildPlan(decision.d, { projectId: cfg.companyId, appLayers: ['frontend'], model: cfg.model, flow: req.flowTemplate ?? null, signals, policy });
     const rules = rulesFor(p, cfg.companyId, overrides);
     const ioKey = await saveIo('orchestrator', { prompt: null, input: { decision: decision.d, project: cfg.companyId }, output: { nodes: p.nodes.map((n) => ({ id: n.id, planned: n.planned, reason: n.reason })), edges: p.edges } });
     return { text: `Plan listo: ${p.nodes.filter((n) => n.planned === 'run').length} pasos a ejecutar, ${p.nodes.filter((n) => n.planned === 'skip').length} omitidos.`, ioKey, p, rules };
@@ -257,11 +266,26 @@ async function develop() {
     secret(`/nadf/${cfg.companyId}/web-env-prod`),
     secret(cfg.app.previewUserSecret, true),
   ]);
-  const llm = createLlm({ apiKey: claudeKey, model: cfg.model });
+  const pol = req.workflow?.policy ?? null;
+  const analysisModel = pol?.models?.analysis ?? cfg.model;
+  const devModel = pol?.models?.development ?? cfg.model;
+  const devBudget = pol?.budgetUsd ?? cfg.budgetUsd;
+  const diffLimit = pol?.limits?.diff_chars ?? 90_000;
+  const fileLimit = pol?.limits?.repo_file_list ?? 1500;
+  const llm = createLlm({ apiKey: claudeKey, model: analysisModel });
   const { owner, name, defaultBranch, installationId } = cfg.app.repo;
   const ghToken = await installationToken(ghApp, installationId, name);
   const auth = gitAuthArgs(ghToken);
   const branch = `nadf/req-${cfg.requestId.slice(0, 8)}`;
+  // Criterios de revisión de la política: bloquear solo por defectos reales; ADR solo en cambios arquitectónicos.
+  const reviewPolicy = pol
+    ? [
+        `Este cambio es «${pol.naturaleza}»${pol.critico ? ' y toca un ámbito crítico' : ''}.`,
+        `Marca "bloqueante" SOLO si: ${(pol.reviewer?.block_only_for ?? []).join(' / ')}`,
+        `Son observaciones (NO bloquean): ${(pol.reviewer?.observations_not_blocking ?? []).join(' / ')}`,
+        pol.adrRequired ? 'Este cambio es arquitectónico: verifica que el diseño esté justificado (ADR).' : 'No exijas ADR: este cambio no es arquitectónico.',
+      ].join('\n')
+    : '';
   const criteria = req.classification?.criterios_aceptacion ?? [];
 
   // ---- Guardián PROD (incluye preparar el repo).
@@ -313,7 +337,7 @@ async function develop() {
   const attBlocks = (await attachmentBlocks(att.files)).blocks;
 
   // ---- Planificador / Arquitecto (solo si el plan los incluye).
-  const fileList = (await git(['ls-files', 'packages/shell/src', 'packages/shared/src'])).out.split('\n').filter(Boolean).slice(0, 1500).join('\n');
+  const fileList = (await git(['ls-files', 'packages/shell/src', 'packages/shared/src'])).out.split('\n').filter(Boolean).slice(0, fileLimit).join('\n');
   let planOut = null;
   let designOut = null;
   for (const [id, schema] of [['planner-agent', SCHEMAS.plan], ['architect-agent', SCHEMAS.design]]) {
@@ -372,9 +396,9 @@ async function develop() {
         ? [`Iteración ${cfg.iteration}: la rama ${branch} ya tiene trabajo (revisa git log/diff contra origin/${defaultBranch}).`, req.report ? `Informe anterior: ${JSON.stringify(req.report)}` : '', feedback ? `Comentarios del revisor:\n${feedback}` : 'Se pidió reintentar.'].join('\n')
         : '',
     ].filter(Boolean).join('\n\n');
-    claude = await runClaude({ cwd: repoDir, prompt, system, model: cfg.model, budgetUsd: cfg.budgetUsd, apiKey: claudeKey, emit, addDirs: att.dir ? [att.dir] : [] });
+    claude = await runClaude({ cwd: repoDir, prompt, system, model: devModel, budgetUsd: devBudget, apiKey: claudeKey, emit, addDirs: att.dir ? [att.dir] : [] });
     if (!claude.ok && claude.subtype !== 'error_max_budget_usd') throw new Stop('failed', 'AGENT_FAILED', 'Claude Code no pudo terminar el desarrollo.', { tail: claude.tail });
-    if (claude.subtype === 'error_max_budget_usd') await emit('warning', `Se alcanzó el presupuesto de ${cfg.budgetUsd} USD de esta ejecución.`);
+    if (claude.subtype === 'error_max_budget_usd') await emit('warning', `Se alcanzó el presupuesto de ${devBudget} USD de esta ejecución.`);
     const reportPath = join(repoDir, 'nadf-report.json');
     if (existsSync(reportPath)) {
       try {
@@ -399,7 +423,7 @@ async function develop() {
       output: report,
       artefactos: { archivos: files, revertidos: reverted },
     });
-    const metrics = { model: cfg.model, inputTokens: claude.inputTokens, outputTokens: claude.outputTokens, costUsd: claude.costUsd, turns: claude.turns, runtime: 'Claude Code 2.1.322' };
+    const metrics = { model: devModel, budgetUsd: devBudget, inputTokens: claude.inputTokens, outputTokens: claude.outputTokens, costUsd: claude.costUsd, turns: claude.turns, runtime: 'Claude Code 2.1.322' };
     return { text: files.length ? `Cambió ${files.length} archivo(s).` : 'No hizo cambios en el código.', output: { archivos: files }, metrics, ioKey };
   });
 
@@ -433,7 +457,7 @@ async function develop() {
   // ---- QA ‖ Guardas de seguridad ‖ Seguridad (en paralelo, como indica el plan).
   // Archivos nuevos: intent-to-add para que aparezcan en el diff que revisan Seguridad y el Revisor.
   await run('git', ['add', '-N', '--', ...files.map((f) => f.replace(/\/$/, ''))], { cwd: repoDir, quiet: true });
-  const diff = (await git(['diff', `origin/${defaultBranch}`, '--', ...files.map((f) => f.replace(/\/$/, ''))])).out.slice(0, 120_000);
+  const diff = (await git(['diff', `origin/${defaultBranch}`, '--', ...files.map((f) => f.replace(/\/$/, ''))])).out.slice(0, diffLimit);
   const screenshots = [];
   const branches = [
     step('qa-agent', 'QA prueba el cambio: lint y capturas antes/después con el usuario admin.', async (emit) => {
@@ -475,12 +499,12 @@ async function develop() {
     const def = agentDefinition(id);
     branches.push(
       step(id, 'El agente de Seguridad revisa el diff.', async (emit) => {
-        const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\nResponde solo con el JSON pedido, en español.`;
-        const user = `Solicitud:\n${req.prompt}\n\nDiff:\n${diff.slice(0, 90_000)}`;
+        const system = `${promptOf(req, id)}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, id))}\n${reviewPolicy}\nResponde solo con el JSON pedido, en español.`;
+        const user = `Solicitud:\n${req.prompt}\n\nDiff:\n${diff}`;
         const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review });
         await emit('thought', data.resumen);
         const ioKey = await saveIo(id, { prompt: { base: def.prompt, instrucciones: ruleText(rulesOf(req, id)), solicitud: req.prompt, contexto: { diff: `${files.length} archivo(s)` } }, input: { archivos: files }, output: data });
-        if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'SECURITY_REVIEW_BLOCKED', `Seguridad bloqueó el cambio: ${data.resumen}`);
+        if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'SECURITY_REVIEW_BLOCKED', `Seguridad bloqueó el cambio: ${data.resumen}`, { metrics, output: data, ioKey });
         return { text: `Veredicto: ${data.veredicto.replace('_', ' ')}.`, output: data, metrics, ioKey };
       }),
     );
@@ -495,12 +519,12 @@ async function develop() {
   if (willRun(req, 'reviewer-agent')) {
     const def = agentDefinition('reviewer-agent');
     await step('reviewer-agent', 'El Revisor compara el cambio con los criterios de aceptación.', async (emit) => {
-      const system = `${promptOf(req, 'reviewer-agent')}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'reviewer-agent'))}\nResponde solo con el JSON pedido, en español.`;
-      const user = `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}\n\nDiff:\n${diff.slice(0, 90_000)}`;
+      const system = `${promptOf(req, 'reviewer-agent')}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'reviewer-agent'))}\n${reviewPolicy}\nResponde solo con el JSON pedido, en español.`;
+      const user = `Criterios de aceptación:\n${criteria.map((c) => `- ${c}`).join('\n')}\n\nDiff:\n${diff}`;
       const { data, metrics } = await llm.json({ system, user, schema: SCHEMAS.review });
       await emit('thought', data.resumen);
       const ioKey = await saveIo('reviewer-agent', { prompt: { base: def.prompt, instrucciones: ruleText(rulesOf(req, 'reviewer-agent')), solicitud: req.prompt, contexto: { criterios: criteria } }, input: { archivos: files }, output: data });
-      if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'REVIEW_BLOCKED', `El Revisor bloqueó el cambio: ${data.resumen}`);
+      if (data.veredicto === 'bloqueante') throw new Stop('blocked', 'REVIEW_BLOCKED', `El Revisor bloqueó el cambio: ${data.resumen}`, { metrics, output: data, ioKey });
       return { text: `Veredicto: ${data.veredicto.replace('_', ' ')}.`, output: data, metrics, ioKey };
     });
   }
