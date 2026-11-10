@@ -1,0 +1,395 @@
+# NADF — Administrador de IA (portal.novusintelligencesolutions.com)
+# Servicio independiente del formulario de contacto (serverless.yml).
+# Despliegue: npx serverless deploy --config serverless-portal.yml --stage dev
+# Fase 0: Cognito (usuarios propios + grupos por rol), tabla DynamoDB, bucket de evidencias,
+# hosting del frontend (S3 privado + CloudFront con OAC) y GET /api/v1/portal/me con JWT.
+service: nadf-portal
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'sa-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+  logRetentionInDays: 30
+  architecture: arm64
+  tags:
+    app: nadf-portal
+    owner: novus-intelligence
+  httpApi:
+    name: nadf-portal-api-${sls:stage}
+    cors:
+      allowedOrigins:
+        - https://portal.novusintelligencesolutions.com
+        - http://localhost:5174
+        # Origen de CloudFront mientras el DNS del dominio no esté listo.
+        - ${env:PORTAL_EXTRA_ORIGIN, 'http://127.0.0.1:5174'}
+      allowedHeaders:
+        - Content-Type
+        - Authorization
+      allowedMethods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      maxAge: 600
+    authorizers:
+      portalJwt:
+        identitySource: $request.header.Authorization
+        issuerUrl:
+          Fn::Join:
+            - ''
+            - - 'https://cognito-idp.'
+              - ${aws:region}
+              - '.amazonaws.com/'
+              - Ref: PortalUserPool
+        audience:
+          - Ref: PortalUserPoolClient
+  environment:
+    NODE_ENV: ${sls:stage}
+    PORTAL_TABLE:
+      Ref: PortalTable
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:Query
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+          Resource:
+            - Fn::GetAtt: [PortalTable, Arn]
+            - Fn::Join: ['', [{ 'Fn::GetAtt': [PortalTable, Arn] }, '/index/*']]
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    target: node20
+    platform: node
+    external: []
+
+package:
+  individually: true
+
+functions:
+  portalMe:
+    name: nadf-portal-me-${sls:stage}
+    handler: src/portal/handlers/me.handler
+    description: NADF — GET /api/v1/portal/me (usuario, empresa, roles y permisos)
+    events:
+      - httpApi:
+          path: /api/v1/portal/me
+          method: get
+          authorizer:
+            name: portalJwt
+
+resources:
+  Resources:
+    # ---------- Identidad: usuarios propios de la plataforma ----------
+    PortalUserPool:
+      Type: AWS::Cognito::UserPool
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        UserPoolName: nadf-portal-${sls:stage}
+        UsernameAttributes: [email]
+        AutoVerifiedAttributes: [email]
+        UsernameConfiguration:
+          CaseSensitive: false
+        MfaConfiguration: OPTIONAL
+        EnabledMfas: [SOFTWARE_TOKEN_MFA]
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 12
+            RequireLowercase: true
+            RequireUppercase: true
+            RequireNumbers: true
+            RequireSymbols: true
+            TemporaryPasswordValidityDays: 7
+        AdminCreateUserConfig:
+          # Sin registro abierto: solo un Admin da de alta usuarios.
+          AllowAdminCreateUserOnly: true
+          InviteMessageTemplate:
+            EmailSubject: Tu acceso a NADF, el administrador de IA de Novus
+            EmailMessage: >-
+              Hola.<br><br>Novus Intelligence Solutions te dio acceso a NADF, su administrador de inteligencia artificial.<br><br>
+              Usuario: {username}<br>Contraseña temporal: {####}<br><br>
+              Ingresa en ${env:PORTAL_URL, 'https://portal.novusintelligencesolutions.com'} y cambia tu contraseña. La contraseña temporal vence en 7 días.
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        UserAttributeUpdateSettings:
+          AttributesRequireVerificationBeforeUpdate: [email]
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Required: true
+            Mutable: true
+          - Name: name
+            AttributeDataType: String
+            Required: false
+            Mutable: true
+          - Name: companyId
+            AttributeDataType: String
+            Mutable: true
+            StringAttributeConstraints:
+              MinLength: '1'
+              MaxLength: '64'
+        UserPoolTags:
+          app: nadf-portal
+
+    PortalUserPoolClient:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: nadf-portal-web-${sls:stage}
+        UserPoolId:
+          Ref: PortalUserPool
+        GenerateSecret: false
+        ExplicitAuthFlows:
+          - ALLOW_USER_SRP_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+        PreventUserExistenceErrors: ENABLED
+        EnableTokenRevocation: true
+        AccessTokenValidity: 60
+        IdTokenValidity: 60
+        RefreshTokenValidity: 7
+        TokenValidityUnits:
+          AccessToken: minutes
+          IdToken: minutes
+          RefreshToken: days
+        ReadAttributes: [email, email_verified, name, 'custom:companyId']
+        # El usuario NO puede cambiar su empresa: custom:companyId no es escribible desde el cliente.
+        # email debe ser escribible porque es atributo obligatorio (su cambio exige verificación).
+        WriteAttributes: [email, name]
+
+    GroupNovusAdmin:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: novus-admin
+        Description: Administra la plataforma NADF (empresas) y todo lo de cada empresa
+        Precedence: 0
+    GroupAdmin:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: admin
+        Description: Todos los permisos dentro de su empresa (incluye pedir y aprobar despliegues)
+        Precedence: 10
+    GroupAprobador:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: aprobador
+        Description: Revisa informes y aprueba o rechaza despliegues a PROD
+        Precedence: 20
+    GroupDesarrollador:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: desarrollador
+        Description: Configura aplicaciones, conectores y agentes; revisa PR
+        Precedence: 30
+    GroupFuncional:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: funcional
+        Description: Pide ajustes al agente y solicita el paso a producción
+        Precedence: 40
+    GroupObservador:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        UserPoolId: { Ref: PortalUserPool }
+        GroupName: observador
+        Description: Solo lectura de informes y despliegues
+        Precedence: 50
+
+    # ---------- Datos ----------
+    PortalTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        TableName: nadf-portal-${sls:stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: PK, AttributeType: S }
+          - { AttributeName: SK, AttributeType: S }
+          - { AttributeName: GSI1PK, AttributeType: S }
+          - { AttributeName: GSI1SK, AttributeType: S }
+          - { AttributeName: GSI2PK, AttributeType: S }
+          - { AttributeName: GSI2SK, AttributeType: S }
+          - { AttributeName: GSI3PK, AttributeType: S }
+        KeySchema:
+          - { AttributeName: PK, KeyType: HASH }
+          - { AttributeName: SK, KeyType: RANGE }
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - { AttributeName: GSI1PK, KeyType: HASH }
+              - { AttributeName: GSI1SK, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
+          - IndexName: GSI2
+            KeySchema:
+              - { AttributeName: GSI2PK, KeyType: HASH }
+              - { AttributeName: GSI2SK, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
+          - IndexName: GSI3
+            KeySchema:
+              - { AttributeName: GSI3PK, KeyType: HASH }
+            Projection: { ProjectionType: ALL }
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        Tags:
+          - { Key: app, Value: nadf-portal }
+
+    EvidenceBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        BucketName: nadf-portal-evidence-${sls:stage}-${aws:accountId}
+        VersioningConfiguration: { Status: Enabled }
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: BucketOwnerEnforced
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+    # ---------- Hosting del frontend ----------
+    PortalSiteBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: nadf-portal-site-${sls:stage}-${aws:accountId}
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: BucketOwnerEnforced
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+    PortalSiteOAC:
+      Type: AWS::CloudFront::OriginAccessControl
+      Properties:
+        OriginAccessControlConfig:
+          Name: nadf-portal-site-${sls:stage}
+          OriginAccessControlOriginType: s3
+          SigningBehavior: always
+          SigningProtocol: sigv4
+
+    PortalDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Comment: NADF Portal ${sls:stage}
+          Enabled: true
+          HttpVersion: http2and3
+          DefaultRootObject: index.html
+          PriceClass: PriceClass_All
+          Origins:
+            - Id: site
+              DomainName:
+                Fn::GetAtt: [PortalSiteBucket, RegionalDomainName]
+              S3OriginConfig:
+                OriginAccessIdentity: ''
+              OriginAccessControlId:
+                Fn::GetAtt: [PortalSiteOAC, Id]
+          DefaultCacheBehavior:
+            TargetOriginId: site
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            # Managed-CachingOptimized
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+            # Managed-SecurityHeadersPolicy (HSTS, X-Frame-Options, nosniff, Referrer-Policy)
+            ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          # SPA: las rutas del router devuelven index.html
+          CustomErrorResponses:
+            - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0 }
+            - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 0 }
+
+    PortalSiteBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket: { Ref: PortalSiteBucket }
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AllowCloudFrontOAC
+              Effect: Allow
+              Principal: { Service: cloudfront.amazonaws.com }
+              Action: s3:GetObject
+              Resource:
+                Fn::Join: ['', [{ 'Fn::GetAtt': [PortalSiteBucket, Arn] }, '/*']]
+              Condition:
+                StringEquals:
+                  AWS:SourceArn:
+                    Fn::Join:
+                      - ''
+                      - - 'arn:aws:cloudfront::'
+                        - ${aws:accountId}
+                        - ':distribution/'
+                        - Ref: PortalDistribution
+
+    PortalMeErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: nadf-portal-me-errors-${sls:stage}
+        AlarmDescription: Errores de la Lambda nadf-portal-me
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: nadf-portal-me-${sls:stage}
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+  Outputs:
+    UserPoolId:
+      Value: { Ref: PortalUserPool }
+    UserPoolClientId:
+      Value: { Ref: PortalUserPoolClient }
+    PortalTableName:
+      Value: { Ref: PortalTable }
+    EvidenceBucketName:
+      Value: { Ref: EvidenceBucket }
+    PortalSiteBucketName:
+      Value: { Ref: PortalSiteBucket }
+    PortalDistributionId:
+      Value: { Ref: PortalDistribution }
+    PortalDistributionDomain:
+      Value:
+        Fn::GetAtt: [PortalDistribution, DomainName]

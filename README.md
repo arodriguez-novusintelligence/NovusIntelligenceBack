@@ -76,3 +76,27 @@ API Gateway (HTTP API) → Lambda (novus-contact-handler) → SES
 - Especificación: `.nadf/projects/novus-intelligence/artifacts/especificacion-backend.md`
 - Plan: `.nadf/projects/novus-intelligence/artifacts/plan-implementacion.md`
 - Resumen implementación: `.nadf/projects/novus-intelligence/artifacts/resumen-backend.md`
+
+## Servicio nadf-portal (Administrador de IA NADF)
+
+Servicio independiente del formulario de contacto, definido en `serverless-portal.yml` (stack `nadf-portal-{stage}`). Fase 0 del plan del documento "NADF — Administrador de IA".
+
+| Recurso | Detalle |
+| --- | --- |
+| Cognito `nadf-portal-{stage}` | Usuarios propios, sin registro abierto, MFA TOTP opcional, grupos `novus-admin`, `admin`, `aprobador`, `desarrollador`, `funcional`, `observador`. `custom:companyId` no es escribible por el usuario |
+| DynamoDB `nadf-portal-{stage}` | Tabla única (PK/SK + GSI1, GSI2, GSI3), PITR y TTL |
+| S3 evidencias | Privado, versionado, cifrado |
+| S3 + CloudFront del portal | Bucket privado con OAC, fallback SPA y cabeceras de seguridad |
+| `GET /api/v1/portal/me` | HTTP API con autorizador JWT de Cognito (ID token). Devuelve usuario, empresa, roles y permisos |
+
+```bash
+npm test                                   # pruebas unitarias (vitest)
+npx serverless deploy --config serverless-portal.yml --stage dev
+# Tras el primer deploy, permitir el origen de CloudFront en CORS:
+PORTAL_EXTRA_ORIGIN=https://<distribucion>.cloudfront.net npx serverless deploy --config serverless-portal.yml --stage dev
+
+# Primer Admin (envía invitación con contraseña temporal)
+node scripts/portal/bootstrap-admin.mjs --stage dev --email admin@empresa.com --name "Nombre Apellido"
+```
+
+El script de arranque es idempotente: crea la empresa (por defecto `novus`), el usuario en Cognito, sus grupos, su registro y una entrada de auditoría.
