@@ -80,7 +80,13 @@ export function policyDecision(signals = {}, policy = agentPolicy()) {
     motivoCritico: signals.motivo_critico || null,
     agents: [...agents],
     adrRequired: (policy.adr?.required_when ?? []).includes(n),
-    models: { analysis: policy.models?.analysis, development: policy.models?.development_by_naturaleza?.[n] ?? policy.models?.development },
+    models: {
+      analysis: policy.models?.analysis,
+      // Económico primero; lo crítico usa el modelo más capaz.
+      development: signals.ambito_critico ? policy.models?.critical_development ?? policy.models?.development : policy.models?.development_by_naturaleza?.[n] ?? policy.models?.development,
+      escalation: policy.models?.escalation ?? null,
+    },
+    effort: policy.development_effort?.[n] ?? null,
     budgetUsd: policy.development_budget_usd?.[n] ?? null,
     limits: policy.context_limits ?? {},
     reviewer: policy.reviewer ?? {},
@@ -124,7 +130,7 @@ export const DEFAULT_CONFIGURABLE = {
     'Reutilizar componentes y estilos existentes.',
     'Textos en español correcto (con tildes); revisar vista móvil y escritorio.',
     'Leer CLAUDE.md, ReglasAgente/ y reglasActuacion/ antes de editar.',
-    'Ejecutar npm run build:prod y corregir errores antes de terminar.',
+    'Si cambias tipos o firmas, verifica solo el paquete tocado (npx tsc --noEmit -p <paquete>); la compilación completa la hace la plataforma.',
   ],
   'qa-agent': ['Tomar capturas antes y después en escritorio y una en móvil.', 'Revisar como máximo 4 rutas.'],
   'security-agent': ['Revisar el diff en busca de secretos, cambios de autenticación o pagos y accesos a datos no pedidos.'],
@@ -296,7 +302,7 @@ export function buildPlan(decision, { projectId, appLayers = ['frontend'], model
     excludedDomains: decision.excludedDomains,
     escalationOn: decision.escalationOn,
     flow: flow ? { id: flow.id, name: flow.name, version: flow.version ?? 1 } : null,
-    policy: pol ? { naturaleza: pol.naturaleza, tamano: pol.tamano, critico: pol.critico, motivoCritico: pol.motivoCritico, adrRequired: pol.adrRequired, models: pol.models, budgetUsd: pol.budgetUsd, limits: pol.limits, reviewer: pol.reviewer } : null,
+    policy: pol ? { naturaleza: pol.naturaleza, tamano: pol.tamano, critico: pol.critico, motivoCritico: pol.motivoCritico, adrRequired: pol.adrRequired, models: pol.models, effort: pol.effort, budgetUsd: pol.budgetUsd, limits: pol.limits, reviewer: pol.reviewer } : null,
     blocked: gated,
     blockReason: blocked
       ? 'El enrutador marcó la solicitud como BLOCKED (información insuficiente o riesgo no evaluable).'

@@ -10,10 +10,7 @@ const ALLOWED_TOOLS = [
   'Grep',
   'LS',
   'TodoWrite',
-  'Task',
   'Bash(npm run lint:*)',
-  'Bash(npm run build:prod)',
-  'Bash(npm run build:prod:*)',
   'Bash(npx tsc:*)',
   'Bash(npx eslint:*)',
   'Bash(npx vitest:*)',
@@ -24,7 +21,8 @@ const ALLOWED_TOOLS = [
   'Bash(ls:*)',
 ];
 
-const DISALLOWED_TOOLS = ['WebFetch', 'WebSearch', 'Bash(git push:*)', 'Bash(git commit:*)', 'Bash(npm run deploy:*)', 'Bash(aws:*)', 'Bash(curl:*)'];
+// Sin subagentes (duplican lectura de contexto) ni compilación completa dentro de la sesión (la hace la plataforma).
+const DISALLOWED_TOOLS = ['Task', 'Bash(npm run build:*)', 'WebFetch', 'WebSearch', 'Bash(git push:*)', 'Bash(git commit:*)', 'Bash(npm run deploy:*)', 'Bash(aws:*)', 'Bash(curl:*)'];
 
 function short(path) {
   return String(path ?? '').replace(/^.*?\/repo\//, '');
@@ -56,7 +54,7 @@ function describeTool(name, input = {}) {
   }
 }
 
-export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey, emit, addDirs = [], timeoutMs = 50 * 60 * 1000 }) {
+export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey, emit, addDirs = [], effort = null, timeoutMs = 50 * 60 * 1000 }) {
   let result = null;
   let lastPlan = '';
   const pending = [];
@@ -75,6 +73,7 @@ export async function runClaude({ cwd, prompt, system, model, budgetUsd, apiKey,
     '--append-system-prompt',
     system,
     ...addDirs.flatMap((d) => ['--add-dir', d]),
+    ...(effort ? ['--effort', effort] : []),
     '--allowedTools',
     ...ALLOWED_TOOLS,
     '--disallowedTools',

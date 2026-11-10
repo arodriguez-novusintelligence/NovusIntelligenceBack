@@ -142,9 +142,21 @@ test('ajuste visual: ningún agente opcional y presupuesto mínimo', () => {
   assert.equal(p.policy.budgetUsd, 3);
 });
 
-test('modelo de desarrollo por naturaleza: Sonnet para ajustes visuales, Opus para el resto', () => {
+test('económico primero: Sonnet para ajustes y evolutivos no críticos; Opus para lo crítico, lo nuevo y lo arquitectónico', () => {
   assert.equal(planWith(sig({ naturaleza: 'ajuste_visual', changeTypes: ['color'] })).policy.models.development, 'claude-sonnet-5-5');
-  assert.equal(planWith(sig()).policy.models.development, 'claude-opus-5-5');
+  assert.equal(planWith(sig()).policy.models.development, 'claude-sonnet-5-5');
+  assert.equal(planWith(sig({ ambito_critico: true, motivo_critico: 'pagos' })).policy.models.development, 'claude-opus-5-5');
+  assert.equal(planWith(sig({ naturaleza: 'nueva_funcionalidad' })).policy.models.development, 'claude-opus-5-5');
+  assert.equal(planWith(sig({ naturaleza: 'cambio_arquitectonico' })).policy.models.development, 'claude-opus-5-5');
+});
+
+test('escalamiento y esfuerzo según la política', () => {
+  const p = planWith(sig()).policy;
+  assert.equal(p.models.escalation.on_build_failure, 'claude-opus-5-5');
+  assert.equal(p.models.escalation.on_iteration, 'claude-opus-5-5');
+  assert.equal(p.effort, 'medium');
+  assert.equal(planWith(sig({ naturaleza: 'ajuste_visual' })).policy.effort, 'low');
+  assert.equal(planWith(sig({ naturaleza: 'cambio_arquitectonico' })).policy.effort, 'high');
 });
 
 test('revisión combinada: un esquema con los dos veredictos', async () => {

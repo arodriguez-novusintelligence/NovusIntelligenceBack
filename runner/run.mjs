@@ -315,7 +315,9 @@ async function develop() {
   ]);
   const pol = req.workflow?.policy ?? null;
   const analysisModel = pol?.models?.analysis ?? cfg.model;
-  const devModel = pol?.models?.development ?? cfg.model;
+  // Correcciones (iteración ≥2) escalan al modelo más capaz: ya se gastó una vez, conviene acertar.
+  const devModel = cfg.iteration > 1 && pol?.models?.escalation?.on_iteration ? pol.models.escalation.on_iteration : pol?.models?.development ?? cfg.model;
+  const devEffort = pol?.effort ?? null;
   const devBudget = pol?.budgetUsd ?? cfg.budgetUsd;
   const diffLimit = pol?.limits?.diff_chars ?? 90_000;
   const fileLimit = pol?.limits?.repo_file_list ?? 1500;
@@ -410,6 +412,9 @@ async function develop() {
     else designOut = out.data;
   }
 
+  // Iteraciones: el diff actual se entrega en el prompt para no releer el repo.
+  const priorDiff = cfg.iteration > 1 && remoteBranch ? (await git(['diff', `origin/${defaultBranch}`])).out.slice(0, 30_000) : '';
+
   // ---- Desarrollador (Claude Code).
   const dev = agentDefinition('frontend-integration-agent');
   const reportSchema = {
@@ -435,6 +440,7 @@ async function develop() {
       ruleText(rulesOf(req, 'frontend-integration-agent')),
       `- AL TERMINAR escribe nadf-report.json en la raíz del repo con este formato (JSON válido, en español): ${JSON.stringify(reportSchema)}`,
       '- En "rutas_a_revisar" pon hasta 4 rutas (path) donde el aprobador ve el cambio; la vista previa abre logueada con un usuario admin.',
+      '- Eficiencia (cada turno relee el contexto): agrupa los cambios de un archivo en una sola edición (MultiEdit); usa Grep/Glob dirigidos; lee archivos grandes por secciones (Read con offset/limit), nunca con cat completo; no compiles todo el proyecto (lo hace la plataforma).',
       req.scopeOverride === 'web_only'
         ? '- ALCANCE ACORDADO: solo la web. Si algo depende de cambios de backend que no existen, protégelo con un feature flag APAGADO por defecto para no romper producción, y explica en "no_hecho" qué falta en el backend.'
         : '',
@@ -457,10 +463,15 @@ async function develop() {
       planOut ? `Plan del Planificador:\n${planOut.pasos.map((s) => `- ${s}`).join('\n')}` : '',
       designOut ? `Diseño del Arquitecto:\n${designOut['diseño']}` : '',
       cfg.iteration > 1
-        ? [`Iteración ${cfg.iteration}: la rama ${branch} ya tiene trabajo (revisa git log/diff contra origin/${defaultBranch}).`, req.report ? `Informe anterior: ${JSON.stringify(req.report)}` : '', feedback ? `Comentarios del revisor:\n${feedback}` : 'Se pidió reintentar.'].join('\n')
+        ? [
+            `Iteración ${cfg.iteration}: la rama ${branch} ya tiene el trabajo anterior. NO vuelvas a explorar el repositorio: corrige SOLO lo señalado.`,
+            priorDiff ? `Cambios actuales respecto de ${defaultBranch} (ya aplicados en tu copia):\n${priorDiff}` : '',
+            req.report ? `Informe anterior: ${JSON.stringify({ resumen: req.report.resumen, no_hecho: req.report.no_hecho, limitaciones: req.report.limitaciones })}` : '',
+            feedback ? `Comentarios a atender:\n${feedback}` : 'Se pidió reintentar.',
+          ].filter(Boolean).join('\n')
         : '',
     ].filter(Boolean).join('\n\n');
-    claude = await runClaude({ cwd: repoDir, prompt, system, model: devModel, budgetUsd: devBudget, apiKey: claudeKey, emit, addDirs: att.dir ? [att.dir] : [] });
+    claude = await runClaude({ cwd: repoDir, prompt, system, model: devModel, budgetUsd: devBudget, apiKey: claudeKey, emit, effort: devEffort, addDirs: att.dir ? [att.dir] : [] });
     if (!claude.ok && claude.subtype !== 'error_max_budget_usd') throw new Stop('failed', 'AGENT_FAILED', 'Claude Code no pudo terminar el desarrollo.', { tail: claude.tail });
     if (claude.subtype === 'error_max_budget_usd') await emit('warning', `Se alcanzó el presupuesto de ${devBudget} USD de esta ejecución.`);
     const reportPath = join(repoDir, 'nadf-report.json');
@@ -487,7 +498,7 @@ async function develop() {
       output: report,
       artefactos: { archivos: files, revertidos: reverted },
     });
-    const metrics = { model: devModel, budgetUsd: devBudget, inputTokens: claude.inputTokens, outputTokens: claude.outputTokens, costUsd: claude.costUsd, turns: claude.turns, runtime: 'Claude Code 2.1.322' };
+    const metrics = { model: devModel, effort: devEffort, budgetUsd: devBudget, inputTokens: claude.inputTokens, outputTokens: claude.outputTokens, costUsd: claude.costUsd, turns: claude.turns, runtime: 'Claude Code 2.1.322' };
     return { text: files.length ? `Cambió ${files.length} archivo(s).` : 'No hizo cambios en el código.', output: { archivos: files }, metrics, ioKey };
   });
 
@@ -506,7 +517,25 @@ async function develop() {
   const shellDist = join(repoDir, 'packages/shell/dist');
   await step('preview', 'Compilando y publicando una vista previa privada.', async (emit) => {
     await emit('tool', 'Ejecutando: npm run build:prod (con los cambios)');
-    await buildProd('Build con los cambios');
+    try {
+      await buildProd('Build con los cambios');
+    } catch (error) {
+      const esc = pol?.models?.escalation;
+      if (!(error instanceof Stop) || error.code !== 'BUILD_FAILED' || !esc?.on_build_failure) throw error;
+      await emit('warning', `La compilación falló: escalo a ${esc.on_build_failure} para corregirla (sesión corta, tope ${esc.fix_budget_usd ?? 1.5} USD).`);
+      const fix = await runClaude({
+        cwd: repoDir,
+        prompt: `La compilación de producción (npm run build:prod) falló con este error:\n${String(error.extra?.tail ?? '').slice(-6000)}\n\nCorrige SOLO la causa de este error en los archivos que cambiaste. No explores el repositorio ni cambies otra cosa.`,
+        system: `${promptOf(req, 'frontend-integration-agent')}\n\nReglas de esta ejecución:\n${ruleText(rulesOf(req, 'frontend-integration-agent'))}`,
+        model: esc.on_build_failure,
+        budgetUsd: esc.fix_budget_usd ?? 1.5,
+        apiKey: claudeKey,
+        emit,
+        effort: 'medium',
+      });
+      tests.push({ name: 'Corrección automática de compilación', status: fix.ok ? 'passed' : 'warning', detail: `${esc.on_build_failure} · ${fix.costUsd ?? '—'} USD` });
+      await buildProd('Build tras la corrección automática');
+    }
     tests.push({ name: 'Compilación de producción (npm run build:prod)', status: 'passed' });
     const builtIndex = await readFile(join(shellDist, 'index.html'), 'utf8');
     await emit('tool', 'AWS (política de sesión: solo archivos nuevos y __nadf/*): publicar vista previa');
