@@ -56,10 +56,12 @@ export function uiStrings(files) {
     for (const m of text.matchAll(LITERAL)) {
       const raw = m[1] ?? m[2] ?? m[3] ?? '';
       for (const part of raw.split(/\$\{[^}]*\}/)) {
-        const s = part.replace(/\\n|\\t/g, ' ').replace(/\s+/g, ' ').trim();
+        // \r: los builds hechos en Windows conservan CRLF dentro de plantillas; no es una diferencia real.
+        const s = part.replace(/\\[nrt]/g, ' ').replace(/\s+/g, ' ').trim();
         if (s.length < 8 || s.length > 240) continue;
         if (!/[a-záéíóúñ]{3,}\s+[a-záéíóúñ]{2,}/i.test(s)) continue;
-        if (/=>|[{};<>]|\bfunction\b|https?:\/\//.test(s)) continue;
+        // Fragmentos de código minificado (cambian con cualquier diff): fuera; solo textos de interfaz.
+        if (/=>|[{};<>=&|$`[\]\\]|\w\(|\)\.|^[,.):]|\bfunction\b|https?:\/\//.test(s)) continue;
         out.add(s);
       }
     }
